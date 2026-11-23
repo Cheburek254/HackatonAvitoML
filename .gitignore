@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+competition/
+runs/
+catboost_info/
+*.parquet
+*.memmap
+*.cbm
+*.pt
+*.safetensors
+competition.zip
+baseline.zip
+.env
+.env.*
+!.env.example
