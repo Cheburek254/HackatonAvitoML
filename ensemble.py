@@ -45,10 +45,13 @@ class Slates:
     def pack(self, column):
         return torch.as_tensor(self.frame[column].to_numpy()[self.rows], device=self.device)
 
-    def metric(self, values):
+    def per_feed_ndcg(self, values):
         order = values.masked_fill(~self.valid, -torch.inf).argsort(dim=1, descending=True, stable=True)
         dcg = (self.targets.gather(1, order) * self.discount).sum(dim=1)
-        return float(torch.where(self.ideal > 0, dcg / self.ideal.clamp_min(1e-8), 1).mean().item())
+        return torch.where(self.ideal > 0, dcg / self.ideal.clamp_min(1e-8), 1)
+
+    def metric(self, values):
+        return float(self.per_feed_ndcg(values).mean().item())
 
     def metrics(self, values):
         order = values.masked_fill(~self.valid, -torch.inf).argsort(dim=1, descending=True, stable=True)
