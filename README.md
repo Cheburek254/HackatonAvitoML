@@ -166,6 +166,12 @@ $round = 'avito-full-v1'
 .\.venv\Scripts\python.exe team_reports.py pull --round $round
 ```
 
+Готовые отчёты по первым прогонам на реальных данных Авито собраны в раунде `avito-pilots`. Команда ниже скачивает их в `runs/team-reports/avito-pilots/`. В сводках указаны размеры выборок, поэтому NDCG прогона на 1 500 лент и прогона на всей `val` можно различить.
+
+```powershell
+.\.venv\Scripts\python.exe team_reports.py pull --round avito-pilots
+```
+
 Для ручных комментариев и рекомендаций сохранены отдельные формы, которые можно отправить через PR в `main`.
 
 - Кирилл — [форма GBDT](reports/gbdt.md)
