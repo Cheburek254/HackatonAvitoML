@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 import pyarrow.parquet as pq
-from catboost import CatBoost, CatBoostRanker, Pool
+from catboost import CatBoost, CatBoostError, CatBoostRanker, Pool
 
 import behavior
 import embedding_clusters
@@ -298,8 +298,21 @@ def new_model(args, iterations):
     )
 
 
+def try_gpu_scores(model, pool, threads):
+    try:
+        return CatBoost.predict(model, pool, thread_count=threads, task_type="GPU")
+    except CatBoostError as error:
+        if "Model contains categorical features, GPU evaluation impossible" not in str(error):
+            raise
+        return None
+
+
 def raw_scores(model, pool, threads, device):
-    return CatBoost.predict(model, pool, thread_count=threads, task_type=device.upper())
+    if device == "gpu":
+        prediction = try_gpu_scores(model, pool, threads)
+        if prediction is not None:
+            return prediction
+    return CatBoost.predict(model, pool, thread_count=threads, task_type="CPU")
 
 
 def select_gpu_checkpoint(model, tuning, val_pool, args):
@@ -308,12 +321,20 @@ def select_gpu_checkpoint(model, tuning, val_pool, args):
     metric = gpu_ndcg_evaluator(tuning)
     step = max(1, min(5, args.iterations // 20))
     checkpoints = sorted({1, model.tree_count_, *range(step, model.tree_count_, step)})
+    full_prediction = try_gpu_scores(model, val_pool, args.threads)
+    if full_prediction is None:
+        print(f"{args.variant}: CatBoost evaluates categorical splits on CPU; NDCG stays on GPU", flush=True)
     best_ndcg, best_tree, curve = -1, 1, []
     for trees in checkpoints:
-        # The CatBoost GPU evaluator applies all trees regardless of ntree_end.
-        checkpoint = model.copy()
-        checkpoint.shrink(trees)
-        prediction = raw_scores(checkpoint, val_pool, args.threads, args.device)
+        if full_prediction is None:
+            prediction = CatBoost.predict(model, val_pool, thread_count=args.threads, ntree_end=trees, task_type="CPU")
+        elif trees == model.tree_count_:
+            prediction = full_prediction
+        else:
+            # The CatBoost GPU evaluator applies all trees regardless of ntree_end.
+            checkpoint = model.copy()
+            checkpoint.shrink(trees)
+            prediction = raw_scores(checkpoint, val_pool, args.threads, "gpu")
         value = metric(prediction)["ndcg"]
         curve.append([trees, value])
         print(f"{args.variant} trees={trees} tuning_ndcg={value:.8f}", flush=True)
