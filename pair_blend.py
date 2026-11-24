@@ -15,6 +15,19 @@ from evaluation import zscore
 from experiments import read_frame, validation
 
 
+def signals(frame, names, method, offset=60):
+    if method == "z-blend":
+        return frame.with_columns(zscore(name).alias(f"{method}_{name}") for name in names)
+    if method == "rrf":
+        return frame.with_columns((1 / (offset + pl.col(name).rank("average", descending=True).over("feed_id")))
+                                  .alias(f"{method}_{name}") for name in names)
+    raise ValueError(f"Unknown blend: {method}")
+
+
+def combine(left, right, weight):
+    return ((1 - weight) * left + weight * right).float()
+
+
 def paired_interval(delta, users):
     # Resample users with replacement, giving each feed equal weight in the mean.
     # Each anonymous feed forms its own cluster.
@@ -49,10 +62,7 @@ def compare(args, output):
         budgets[name] = source["train_feeds"]
     frame = add_model_scores(labels.select("feed_id", "item_id", "timestamp", "target"),
                              [pl.read_parquet(path / "val_predictions.parquet") for path in paths], names)
-    frame = frame.with_columns(
-        *[zscore(name).alias("z-blend_" + name) for name in names],
-        *[(1 / (60 + pl.col(name).rank("average", descending=True).over("feed_id"))).alias("rrf_" + name)
-          for name in names])
+    frame = signals(signals(frame, names, "z-blend"), names, "rrf")
     early = Slates(frame.filter(pl.col("timestamp") < cutoff), device)
     full = Slates(frame, device)
     if not np.array_equal(full.frame["feed_id"].to_numpy()[full.rows[:, 0]], feeds["feed_id"].to_numpy()):
@@ -72,12 +82,12 @@ def compare(args, output):
         print(f"Starting {method}", flush=True)
         columns = [f"{method}_{name}" for name in names]
         left, right = map(early.pack, columns)
-        grid = [{"right_weight": w / 10, "early_ndcg": early.metric(((1 - w / 10) * left + w / 10 * right).float())}
+        grid = [{"right_weight": w / 10, "early_ndcg": early.metric(combine(left, right, w / 10))}
                 for w in range(11)]
         weight = max(grid, key=lambda row: row["early_ndcg"])["right_weight"]
         search[method], weights[method] = grid, weight
         left, right = map(full.pack, columns)
-        values = ((1 - weight) * left + weight * right).float()
+        values = combine(left, right, weight)
         record(method, values)
         full.predictions(values).write_parquet(output / f"{method}_val_predictions.parquet")
         print(f"Finished {method}: right_weight={weight:.1f}, holdout_ndcg={rows[-1]['holdout']['ndcg']:.8f}",
