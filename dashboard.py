@@ -85,8 +85,14 @@ class Dashboard:
         style.map("TCombobox", fieldbackground=[("readonly", PANEL)], foreground=[("readonly", TEXT)])
         self.root.option_add("*TCombobox*Listbox.background", PANEL)
         self.root.option_add("*TCombobox*Listbox.foreground", TEXT)
-        style.configure("TCheckbutton", indicatorbackground=PANEL)
-        style.map("TCheckbutton", background=[("active", BG)], indicatorcolor=[("selected", ACCENT)])
+        style.configure("TCheckbutton", indicatorbackground=PANEL, indicatorforeground=BG)
+        style.map(
+            "TCheckbutton",
+            background=[("active", BG)],
+            indicatorbackground=[("selected", ACCENT), ("!selected", PANEL)],
+            indicatorforeground=[("selected", BG), ("!selected", PANEL)],
+            foreground=[("selected", TEXT), ("!selected", "#637587")],
+        )
         style.configure("Treeview", background=PANEL, fieldbackground=PANEL, foreground=TEXT,
                         bordercolor=BORDER, rowheight=25)
         style.configure("Treeview.Heading", background=BG, foreground=MUTED)

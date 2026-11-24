@@ -23,9 +23,20 @@ CATEGORY_TREND_FEATURES = ["category_share_last8", "category_share_previous56", 
 WIDE_TREND_FEATURES = ["category_share_last16", "category_share_previous112", "category_trend_wide"]
 CLUSTER_FEATURES = ["embedding_cluster", "cluster_history_share", "cluster_cosine"]
 DIN_FEATURES = ["din_max_cosine", "din_top3_cosine", "din_best_recency", "din_match_available"]
+EVENT_DIN_FEATURES = [
+    "din_decay_max_cosine", "din_best_event_type", "din_best_event_source",
+    "din_ev1_max_cosine", "din_ev_other_max_cosine", "din_ev_strong_max_cosine",
+]
 SIM_FEATURES = ["sim_top16_cosine", "sim_recent_cosine", "sim_matching_category_share"]
 MIND_FEATURES = ["mind_best_cosine", "mind_category_cosine", "mind_interest_count"]
+SIM_RANK_SOURCES = ["user_item_cosine", "recent_items_cosine", "din_max_cosine", "din_top3_cosine",
+                    "sim_recent_cosine", "mind_best_cosine"]
+SIM_RANK_FEATURES = [
+    *(f"{name}_feed_percentile" for name in SIM_RANK_SOURCES),
+    *(f"{name}_feed_delta" for name in SIM_RANK_SOURCES),
+]
 FEATURES = ["category_id", *BASE_FEATURES, *PERCENTILES, "user_item_cosine", "item_embedding_missing", *HISTORY_FEATURES]
+COMBO_FEATURES = [*FEATURES, *DIN_FEATURES, *SIM_FEATURES, *MIND_FEATURES, *WIDE_TREND_FEATURES]
 VARIANTS = {
     "avito-features": AVITO_FEATURES,
     "history": FEATURES,
@@ -39,6 +50,10 @@ VARIANTS = {
     "embedding-clusters": [*FEATURES, *CLUSTER_FEATURES],
     "history-distill": FEATURES,
     "category-trend-pixie": [*FEATURES, *CATEGORY_TREND_FEATURES, *behavior.FEATURES["pixie"]],
+    "combo": COMBO_FEATURES,
+    "combo-ranks": [*COMBO_FEATURES, *SIM_RANK_FEATURES],
+    "din-events": [*FEATURES, *DIN_FEATURES, *EVENT_DIN_FEATURES],
+    "din-events-pos": [*FEATURES, *DIN_FEATURES, *EVENT_DIN_FEATURES, "pos_bias"],
 }
 VARIANTS["strong-gbdt"] = [*FEATURES, *CATEGORY_TREND_FEATURES, *SIM_FEATURES, *behavior.FEATURES["strong-gbdt"]]
 STACK_FEATURES = ["stack_joint_z", "stack_gru_z"]
@@ -113,6 +128,29 @@ def matching_features(items, categories, history_items, history_categories, posi
                      np.where(present, category_match.mean(axis=1), 0)])
 
 
+def event_din_features(items, history_items, event_types, event_sources, positions):
+    valid = np.linalg.norm(history_items, axis=1) > 0
+    history = history_items[valid]
+    if not len(history):
+        return np.zeros((len(EVENT_DIN_FEATURES), len(items)), dtype=np.float32)
+    ev_types = event_types[valid]
+    ev_sources = event_sources[valid]
+    pos = positions[valid]
+    present = np.linalg.norm(items, axis=1) > 0
+    similarities = pair_cosine(items, history)
+    decayed = similarities * np.exp2(-pos / 16)[None, :]
+    best = np.argmax(similarities, axis=1)
+    best_type = np.where(present, ev_types[best], 0)
+    best_source = np.where(present, ev_sources[best], 0)
+    ev1 = ev_types == 1
+    ev_other = ev_types > 1
+    ev_strong = ev_types >= 4
+    ev1_max = similarities[:, ev1].max(axis=1) if ev1.any() else np.zeros(len(items), dtype=np.float32)
+    other_max = similarities[:, ev_other].max(axis=1) if ev_other.any() else np.zeros(len(items), dtype=np.float32)
+    strong_max = similarities[:, ev_strong].max(axis=1) if ev_strong.any() else np.zeros(len(items), dtype=np.float32)
+    return np.stack([decayed.max(axis=1), best_type, best_source, ev1_max, other_max, strong_max]).astype(np.float32)
+
+
 def vector_features(feed, embeddings, feature_names, reference, clusters=None):
     item_ids = np.asarray(feed["item_id"])
     categories = np.asarray(feed["category_id"])
@@ -156,8 +194,21 @@ def vector_features(feed, embeddings, feature_names, reference, clusters=None):
         result.update(zip(CLUSTER_FEATURES, values, strict=True))
     for mode, names in (("din", DIN_FEATURES), ("sim", SIM_FEATURES), ("multi-interest", MIND_FEATURES)):
         if names[0] in feature_names:
-            values = matching_features(items, categories, history_items, history_categories[history_present], positions, mode)
+            use_all = mode == "sim" or window == RECENT_EVENTS
+            mode_items = history_items if use_all else history_items[recent_vectors]
+            mode_cats = history_categories[history_present] if use_all else history_categories[history_present][recent_vectors]
+            mode_pos = positions if use_all else positions[recent_vectors]
+            values = matching_features(items, categories, mode_items, mode_cats, mode_pos, mode)
             result.update(zip(names, values, strict=True))
+    if EVENT_DIN_FEATURES[0] in feature_names:
+        ev_types = np.asarray([0 if v is None else v for v in feed["history__event_type"][:window]], dtype=np.int32)
+        ev_sources = np.asarray([0 if v is None else v for v in feed["history__event_source"][:window]], dtype=np.int32)
+        values = event_din_features(
+            items, history_items[recent_vectors],
+            ev_types[history_present][recent_vectors], ev_sources[history_present][recent_vectors],
+            positions[recent_vectors],
+        )
+        result.update(zip(EVENT_DIN_FEATURES, values, strict=True))
     if reference is not None:
         result.update(zip(behavior.FEATURES[reference.kind], reference.score(feed), strict=True))
     return result
@@ -165,9 +216,16 @@ def vector_features(feed, embeddings, feature_names, reference, clusters=None):
 
 def expand_batch(feeds, embeddings, labeled, features, reference, clusters=None):
     per_feed = [vector_features(feed, embeddings, features, reference, clusters) for feed in feeds.iter_rows(named=True)]
-    arrays = [*CANDIDATE_COLUMNS, *(["target"] if labeled else [])]
+    has_pos = "pos" in feeds.columns
+    arrays = [*CANDIDATE_COLUMNS, *(["target"] if labeled else []), *(["pos"] if has_pos else [])]
     candidates = feeds.select("feed_id", *arrays).explode(arrays).drop("item_id__embedding_idx")
-    return candidates.with_columns(
+    if "pos_bias" in features:
+        candidates = candidates.with_columns(
+            pl.col("pos").cast(pl.Float32).alias("pos_bias") if has_pos else pl.lit(0.0, dtype=pl.Float32).alias("pos_bias")
+        )
+        if has_pos:
+            candidates = candidates.drop("pos")
+    candidates = candidates.with_columns(
         *[
             pl.Series(name, np.concatenate([columns[name] for columns in per_feed]).astype(np.float32))
             for name in per_feed[0]
@@ -178,6 +236,20 @@ def expand_batch(feeds, embeddings, labeled, features, reference, clusters=None)
             for name, percentile in zip(BASE_FEATURES, PERCENTILES, strict=True) if percentile in features
         ],
     )
+    extra_ranks = [
+        expr
+        for name in SIM_RANK_SOURCES
+        for expr in (
+            (pl.col(name).rank("average").over("feed_id") / pl.len().over("feed_id"))
+            .cast(pl.Float32).alias(f"{name}_feed_percentile")
+            if f"{name}_feed_percentile" in features else None,
+            (pl.col(name) - pl.col(name).mean().over("feed_id"))
+            .cast(pl.Float32).alias(f"{name}_feed_delta")
+            if f"{name}_feed_delta" in features else None,
+        )
+        if expr is not None
+    ]
+    return candidates.with_columns(extra_ranks) if extra_ranks else candidates
 
 
 def feed_batches(split, columns, max_feeds=0, *, offset=0):
@@ -218,6 +290,12 @@ def candidate_batches(split, *, features=FEATURES, labeled=False, max_feeds=0,
     columns = ["feed_id", "user_embedding", *CANDIDATE_COLUMNS]
     if "history_length" in features:
         columns.extend(HISTORY_COLUMNS)
+    if EVENT_DIN_FEATURES[0] in features:
+        columns.extend(["history__event_type", "history__event_source"])
+    if "pos_bias" in features:
+        first_part = next(iter(sorted((split / "impressions").glob("part-*.parquet"))), None)
+        if first_part is not None and "pos" in pq.ParquetFile(first_part).schema_arrow.names:
+            columns.append("pos")
     if reference is not None:
         columns.append("user_id")
     if labeled:
