@@ -74,44 +74,6 @@ def official_catboost(args, tune_ids, output):
     return baseline.predict_scores(candidates, model)
 
 
-def fit_archive_transformer_cuda(baseline, training, tuning, output, config):
-    import torch
-    from torch.nn.functional import binary_cross_entropy_with_logits
-
-    output.mkdir(parents=True, exist_ok=False)
-    torch.set_num_threads(config["threads"])
-    torch.manual_seed(config["seed"])
-    model_params = {key: config[key] for key in ("width", "layers", "dropout")}
-    model = baseline.Ranker(len(training.categories_mapping), **model_params).cuda()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config["learning_rate"], weight_decay=config["weight_decay"])
-    train = baseline.DataLoader(training, batch_size=config["batch_size"], shuffle=True, collate_fn=baseline.collate_feeds)
-    validation = baseline.DataLoader(tuning, batch_size=config["batch_size"], collate_fn=baseline.collate_feeds)
-
-    def batch_loss(batch):
-        features, categories, users, padding, target = (tensor.cuda() for tensor in batch)
-        logits = model(features, categories, users, padding)
-        # Static masking preserves the archive's BCE over valid rows and avoids CUDA boolean indexing in backward.
-        loss = binary_cross_entropy_with_logits(logits, target, reduction="none")
-        return loss.masked_fill(padding, 0).sum(), (~padding).sum()
-
-    history, best = [], float("inf")
-    for epoch in range(1, config["epochs"] + 1):
-        model.train()
-        train_sum = 0.
-        for batch in train:
-            optimizer.zero_grad(set_to_none=True)
-            summed, count = batch_loss(batch)
-            (summed / count).backward()
-            optimizer.step()
-            train_sum += summed.item()
-        model.eval()
-        with torch.inference_mode():
-            val_sum = sum(batch_loss(batch)[0].item() for batch in validation)
-        metrics = {"epoch": epoch, "train_logloss": train_sum / len(training.keys), "val_logloss": val_sum / len(tuning.keys)}
-        best = baseline.save_epoch(model, training, tuning, output, config, metrics, history, best)
-        print(f"avito-transformer epoch={epoch} val_logloss={metrics['val_logloss']:.6f}", flush=True)
-
-
 def official_transformer(args, tune_ids, output):
     import torch
     from torch.utils.data import Subset
@@ -124,10 +86,7 @@ def official_transformer(args, tune_ids, output):
     tuning.keys = val.keys.filter(val.keys["feed_id"].is_in(tune_ids))
     config = {**baseline.TRAIN_CONFIG, "device": args.neural_device, "epochs": args.epochs,
               "threads": args.threads, "batch_size": args.batch_size}
-    if args.neural_device == "cuda":
-        fit_archive_transformer_cuda(baseline, training, tuning, output, config)
-    else:
-        baseline.fit(training, tuning, output, config)
+    baseline.fit(training, tuning, output, config)
     checkpoint = torch.load(output / "model.pt", map_location="cpu", weights_only=True)
     model = baseline.Ranker(len(training.categories_mapping), **checkpoint["model_params"]).to(args.neural_device)
     model.load_state_dict(checkpoint["state_dict"])
@@ -277,11 +236,12 @@ def benchmark(args):
     metric = ndcg
     selected = None
     if args.gpu is not None:
-        from accelerator import cuda_tensor, gpu_ndcg, select_gpu
+        from accelerator import cuda_tensor, gpu_ndcg, has_torch_cuda, select_gpu
 
         selected = select_gpu(args.gpu)
         print(f"GPU: {selected.name} ({selected.memory})", flush=True)
-        cuda_tensor()
+        if not has_torch_cuda():
+            cuda_tensor()
         metric = gpu_ndcg
     labels, cutoff = validation(args.data, args.val_feeds)
     tune_ids = labels.filter(pl.col("timestamp") < cutoff)["feed_id"].unique()

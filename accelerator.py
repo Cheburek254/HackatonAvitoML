@@ -56,6 +56,16 @@ def cuda_tensor():
 
 
 def category_coefficients(inputs, targets):
+    if has_torch_cuda() and not cuda_tensor.cache_info().currsize:
+        import torch
+
+        design = torch.as_tensor(inputs, device="cuda")
+        target = torch.as_tensor(targets, device="cuda")
+        weights = design.new_zeros(inputs.shape[1])
+        for _ in range(80):
+            residual = (design @ weights).sigmoid() - target
+            weights -= .6 * ((design.T @ residual) / len(targets) + .002 * weights)
+        return weights.cpu().numpy()
     tensor = cuda_tensor()
     design = tensor(inputs, device="CUDA").realize()
     target = tensor(targets, device="CUDA").realize()
@@ -126,7 +136,8 @@ def has_torch_cuda():
 
 
 def gpu_ndcg_evaluator(frame):
-    if not has_torch_cuda():
+    # Tinygrad uses a driver-created context. Avoid switching to PyTorch in the same process after initializing it.
+    if cuda_tensor.cache_info().currsize or not has_torch_cuda():
         return GpuNDCG(frame)
     import torch
     from ensemble import Slates
