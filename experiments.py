@@ -285,7 +285,7 @@ def run_benchmark(args, labels, cutoff, tune_ids, metric, selected):
                "family_blends": args.family_blends, "stack": args.stack, "optuna_trials": args.optuna_trials,
                "reuse_models_from": [str(path) for path in args.reuse_models_from], "no_rrf": args.no_rrf}
     report_path = args.output / "report.json"
-    if args.resume:
+    if args.resume and report_path.is_file():
         previous = json.loads(report_path.read_text(encoding="utf-8"))
         # Older reports recorded the train limit and actual val count only.
         previous.setdefault("train_feeds", train_feeds)
@@ -299,6 +299,8 @@ def run_benchmark(args, labels, cutoff, tune_ids, metric, selected):
         for path in files.values():
             attach_scores(labels, pl.read_parquet(path))
         print(f"Resuming with {len(results)} completed models", flush=True)
+    elif args.resume and any(path.name != ".benchmark.lock" for path in args.output.iterdir()):
+        raise ValueError("Cannot resume: the benchmark has outputs but no report")
     report["options"] = options
     groups = category_groups(args, cutoff) if args.by_category else None
     import_results(args, report, labels, results, files)

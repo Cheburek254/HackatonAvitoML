@@ -112,7 +112,7 @@ def sync(round_name, name, path, *, extra=None):
         publish(round_name, name, path, extra=extra)
         pull(round_name, None)
     except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as error:
-        print(f"Git reports: {error}. Local results are saved. Repeat the same command to retry.",
+        print(f"Git reports: {error}. Local results are saved. Use team_reports.py publish or pull to retry.",
               file=sys.stderr, flush=True)
 
 

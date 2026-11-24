@@ -121,7 +121,7 @@ def train_part(args, settings, part, val_sample):
                 "--models", *settings["models"], "--train-offset", part["offset"], "--train-feeds", part["feeds"],
                 "--val-feeds", args.val_feeds, "--iterations", args.iterations, "--epochs", args.epochs,
                 "--history-window", args.history_window, "--batch-size", args.batch_size, "--threads", args.threads,
-                "--no-rrf", *(["--resume"] if existing else []), log=log)
+                "--no-rrf", *(["--resume"] if fit.is_dir() else []), log=log)
             code = 0
         finally:
             if status is not None:
