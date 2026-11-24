@@ -53,6 +53,13 @@ python -m venv .venv
 
 ### RRF и Z-бленд двух обученных моделей
 
+Чтобы повторить полный эксперимент на одном компьютере, сначала запустите CatBoost. Когда появится окно с первой частью, выполните вторую команду в другом терминале. Очередь дождётся объединения шести частей, обучит `gru-din-plus` на 200 000 лент за 5 эпох и переключит то же окно на сравнение. В Windows очередь предотвращает автоматический сон от простоя на зарядке. Блокировка экрана допустима. Действие при закрытии крышки задаётся в настройках питания Windows.
+
+```powershell
+.\.venv\Scripts\python.exe sharded_runs.py train --data C:/study/AvitoData/competition --output runs/avito-real/din-events-v2-third-600 --models din-events-v2 --train-feeds 1050403 --val-feeds 0 --shards 6 --iterations 600 --epochs 5 --gpu 0 --person all --ui --report-round avito-third-v1
+.\.venv\Scripts\python.exe training_queue.py --data C:/study/AvitoData/competition --catboost runs/avito-real/din-events-v2-third-600 --output runs/avito-real/gru-pair-third --gpu 0 --report-round avito-third-v1
+```
+
 `pair_blend.py` принимает две папки моделей с `val_predictions.parquet` и отчётом `report.json` в родительской папке. Слева можно передать результат объединения частей CatBoost, справа — результат одного обучения GRU. Обе модели должны покрывать полную валидацию соревнования.
 
 ```powershell

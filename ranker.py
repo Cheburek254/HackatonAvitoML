@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -26,6 +27,10 @@ DIN_FEATURES = ["din_max_cosine", "din_top3_cosine", "din_best_recency", "din_ma
 EVENT_DIN_FEATURES = [
     "din_decay_max_cosine", "din_best_event_type", "din_best_event_source",
     "din_ev1_max_cosine", "din_ev_other_max_cosine", "din_ev_strong_max_cosine",
+]
+FEED_CONTEXT_FEATURES = [
+    "cat_share_in_feed", "f5_zscore", "f5_minus_max", "f5_cat_delta", "f3_zscore", "feed_size",
+    "top5_f5_cosine", "din_long_max_cosine", "din_long_ev_other_max",
 ]
 SIM_FEATURES = ["sim_top16_cosine", "sim_recent_cosine", "sim_matching_category_share"]
 MIND_FEATURES = ["mind_best_cosine", "mind_category_cosine", "mind_interest_count"]
@@ -54,6 +59,7 @@ VARIANTS = {
     "combo-ranks": [*COMBO_FEATURES, *SIM_RANK_FEATURES],
     "din-events": [*FEATURES, *DIN_FEATURES, *EVENT_DIN_FEATURES],
     "din-events-pos": [*FEATURES, *DIN_FEATURES, *EVENT_DIN_FEATURES, "pos_bias"],
+    "din-events-v2": [*FEATURES, *DIN_FEATURES, *EVENT_DIN_FEATURES, *FEED_CONTEXT_FEATURES],
 }
 VARIANTS["strong-gbdt"] = [*FEATURES, *CATEGORY_TREND_FEATURES, *SIM_FEATURES, *behavior.FEATURES["strong-gbdt"]]
 STACK_FEATURES = ["stack_joint_z", "stack_gru_z"]
@@ -165,7 +171,7 @@ def vector_features(feed, embeddings, feature_names, reference, clusters=None):
     if "history_length" not in feature_names:
         return result
 
-    window = 256 if SIM_FEATURES[0] in feature_names else RECENT_EVENTS
+    window = 256 if (SIM_FEATURES[0] in feature_names or "din_long_max_cosine" in feature_names) else RECENT_EVENTS
     history_ids = np.asarray(feed["history__item_id"][:window], dtype=np.int32)
     history_categories = np.asarray(feed["history__category_id"][:window])
     history_indices = np.asarray(feed["history__item_id__embedding_idx"][:window], dtype=np.intp)
@@ -209,6 +215,32 @@ def vector_features(feed, embeddings, feature_names, reference, clusters=None):
             positions[recent_vectors],
         )
         result.update(zip(EVENT_DIN_FEATURES, values, strict=True))
+    if "top5_f5_cosine" in feature_names:
+        f5 = np.nan_to_num(np.asarray(feed["f5"], dtype=np.float32), nan=-1e9)
+        valid_cand = np.flatnonzero(present)
+        if len(valid_cand):
+            top_k = valid_cand[np.argsort(-f5[valid_cand])[:min(5, len(valid_cand))]]
+            top_vecs = items[top_k]
+            norms = np.linalg.norm(top_vecs, axis=1, keepdims=True)
+            proto = np.divide(top_vecs, norms, out=np.zeros_like(top_vecs), where=norms > 0).mean(axis=0)
+            result["top5_f5_cosine"] = cosine(items, proto)
+        else:
+            result["top5_f5_cosine"] = np.zeros(len(item_ids), dtype=np.float32)
+    if "din_long_max_cosine" in feature_names:
+        long_mask = ~recent_vectors
+        long_items = history_items[long_mask]
+        long_valid = np.linalg.norm(long_items, axis=1) > 0
+        long_items = long_items[long_valid]
+        if len(long_items):
+            ev_types_all = np.asarray([0 if v is None else v for v in feed["history__event_type"][:window]], dtype=np.int32)
+            long_ev = ev_types_all[history_present][long_mask][long_valid]
+            long_sims = pair_cosine(items, long_items)
+            result["din_long_max_cosine"] = long_sims.max(axis=1)
+            other_m = long_ev > 1
+            result["din_long_ev_other_max"] = long_sims[:, other_m].max(axis=1) if other_m.any() else np.zeros(len(item_ids), dtype=np.float32)
+        else:
+            result["din_long_max_cosine"] = np.zeros(len(item_ids), dtype=np.float32)
+            result["din_long_ev_other_max"] = np.zeros(len(item_ids), dtype=np.float32)
     if reference is not None:
         result.update(zip(behavior.FEATURES[reference.kind], reference.score(feed), strict=True))
     return result
@@ -249,6 +281,15 @@ def expand_batch(feeds, embeddings, labeled, features, reference, clusters=None)
         )
         if expr is not None
     ]
+    if "cat_share_in_feed" in features:
+        extra_ranks.extend([
+            (pl.len().over("feed_id", "category_id") / pl.len().over("feed_id")).cast(pl.Float32).alias("cat_share_in_feed"),
+            ((pl.col("f5") - pl.col("f5").mean().over("feed_id")) / pl.col("f5").std().over("feed_id").fill_null(1.0).clip(lower_bound=1e-6)).cast(pl.Float32).alias("f5_zscore"),
+            (pl.col("f5") - pl.col("f5").max().over("feed_id")).cast(pl.Float32).alias("f5_minus_max"),
+            (pl.col("f5") - pl.col("f5").mean().over("feed_id", "category_id")).cast(pl.Float32).alias("f5_cat_delta"),
+            ((pl.col("f3") - pl.col("f3").mean().over("feed_id")) / pl.col("f3").std().over("feed_id").fill_null(1.0).clip(lower_bound=1e-6)).cast(pl.Float32).alias("f3_zscore"),
+            pl.len().over("feed_id").cast(pl.Float32).alias("feed_size"),
+        ])
     return candidates.with_columns(extra_ranks) if extra_ranks else candidates
 
 
@@ -397,7 +438,9 @@ def select_gpu_checkpoint(model, tuning, val_pool, args):
     from accelerator import gpu_ndcg_evaluator
 
     metric = gpu_ndcg_evaluator(tuning)
-    step = max(1, min(5, args.iterations // 20))
+    step = max(1, args.iterations // 20)
+    if args.variant != "din-events-v2":
+        step = min(5, step)
     checkpoints = sorted({1, model.tree_count_, *range(step, model.tree_count_, step)})
     full_prediction = try_gpu_scores(model, val_pool, args.threads)
     if full_prediction is None:
@@ -526,6 +569,12 @@ def train(args):
     report["peak_private_mib"] = peak_ram_mib(private=True)
     (args.output / "metrics.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(json.dumps({key: value for key, value in report.items() if key != "tuning_curve"}, indent=2))
+    if args.tune_before is None and os.environ.get("AVITO_NOTIFY_TELEGRAM") == "1":
+        try:
+            import notify_tg
+            notify_tg.send(notify_tg.format_ranker(args.output, report))
+        except Exception:
+            pass
 
 
 def score_batch(model, candidates, threads, device="cpu"):

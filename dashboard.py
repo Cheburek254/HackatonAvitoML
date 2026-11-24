@@ -61,7 +61,8 @@ class Dashboard:
         self.gpu = tk.StringVar()
         self.iterations, self.epochs = tk.StringVar(value="100"), tk.StringVar(value="5")
         self.train_feeds, self.val_feeds = tk.StringVar(value="0"), tk.StringVar(value="0")
-        self.selection = {name: tk.BooleanVar(value=True) for name in GPU_ABLATION}
+        self.selection = {name: tk.BooleanVar(value=name in GPU_ABLATION)
+                          for name in (*GPU_ABLATION, "din-events-v2", "gru-din-plus", "neural-din-plus")}
         self.status = tk.StringVar(value="Готово к запуску")
         self.sample = tk.StringVar()
         self.stage = tk.StringVar(value="")
@@ -359,9 +360,10 @@ class Dashboard:
             self.curve.append((int(step), float(value)))
             self.draw_curve()
             self.stage.set(f"Проверка {model} · полная NDCG {float(value):.5f}")
-            total = self.budget[1 if model == "dual-history" else 0]
+            epoch = " epoch=" in line
+            total = self.budget[1 if epoch else 0]
             current = int(step) / total
-            self.model_progress.set(100 * (current if model == "dual-history" else .75 + .25 * current))
+            self.model_progress.set(100 * (current if epoch else .75 + .25 * current))
         elif match := BATCH.search(line):
             epoch, batch, total = map(int, match.groups())
             self.stage.set(f"Эпоха {epoch}/{self.budget[1]} · батч {batch}/{total}")
