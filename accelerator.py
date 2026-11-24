@@ -115,5 +115,34 @@ class GpuNDCG:
         return dict(zip(("ndcg", "ndcg_at_10", "ndcg_at_30"), map(float, values), strict=True))
 
 
+@lru_cache(maxsize=1)
+def has_torch_cuda():
+    try:
+        import torch
+
+        return torch.cuda.is_available()
+    except (ImportError, OSError):
+        return False
+
+
+def gpu_ndcg_evaluator(frame):
+    if not has_torch_cuda():
+        return GpuNDCG(frame)
+    import torch
+    from ensemble import Slates
+
+    indexed = frame.with_row_index("_original_row")
+    if "item_id" not in indexed:
+        indexed = indexed.with_columns(pl.col("_original_row").alias("item_id"))
+    slates = Slates(indexed, "cuda")
+    original = slates.frame["_original_row"].to_numpy()[slates.rows]
+
+    def score(values):
+        packed = torch.as_tensor(values[original], dtype=torch.float32, device="cuda")
+        return slates.metrics(packed)
+
+    return score
+
+
 def gpu_ndcg(frame: pl.DataFrame):
-    return GpuNDCG(frame)(frame["score"].to_numpy())
+    return gpu_ndcg_evaluator(frame)(frame["score"].to_numpy())

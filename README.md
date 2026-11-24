@@ -35,6 +35,87 @@ python -m venv .venv
 
 `--train-feeds 0 --val-feeds 0` использует обе выборки целиком. Сначала стоит измерить расход RAM на ограниченной выборке. CatBoost читает эмбеддинги через memmap, а развёрнутые признаки для обучения собирает в RAM. Для сравнения на GPU есть `--cat-device gpu` и `--neural-device cuda`. Вариант `lambda` обучается на CPU.
 
+## Три семейства и стекинг
+
+Команда ниже запускает сравнение на реальных данных с одинаковыми лентами для всех моделей. Для нейросетей на NVIDIA установите CUDA-сборку PyTorch. [Сборки PyTorch](https://pytorch.org/get-started/previous-versions/#v2100)
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-experiments.txt -r requirements-gpu.txt
+.\.venv\Scripts\python.exe -m pip install "torch==2.10.0+cu126" --index-url https://download.pytorch.org/whl/cu126
+.\.venv\Scripts\python.exe experiments.py benchmark --data .\competition --output .\runs\avito-ensemble --gpu 0 --models history category-trend strong-gbdt avito-joint set-transformer neural-pairwise gru-din sasrec --train-feeds 6000 --val-feeds 1500 --iterations 60 --epochs 2 --family-blends --stack
+```
+
+`strong-gbdt` объединяет тренд категории, SIM, направленные переходы, Pixie, динамику популярности и прогноз категории, обученный на более ранних лентах. В ансамбль входят `strong-gbdt` и лучшие по ранней `val` представители listwise- и последовательного семейств. Optuna подбирает веса Z-нормировки и RRF на ранней `val`. Там же проверяется штраф за повтор категории в первых 20 позициях. Сетка штрафов включает значение 0.
+
+Для стекинга `avito-joint` и `gru-din` предсказывают более поздние блоки `train` после обучения на предыдущих блоках. `stack-gbdt` получает два нормированных скора. Контроль `stack-base` использует те же обучающие ленты и обычные признаки `strong-gbdt`. Все итоговые сравнения выполняются по полной NDCG на поздней `val`.
+
+## Распределение по нескольким компьютерам
+
+Командный патч входит в эту версию проекта. В существующей копии обновитесь командой `git pull --ff-only`. Файл `team-training.patch`, который передавался отдельно, рассчитан на исходный коммит `46895ba` и применяется через `git apply team-training.patch`. Если патч уже применён локально, для командного запуска можно использовать новый клон `main`.
+
+Каждая машина обучает своё семейство на одинаковых лентах. По умолчанию используются первые 50 000 лент `train`, вся `val`, 120 итераций CatBoost и 3 эпохи для нейросетей. Используйте одну версию кода и один архив Авито. В примерах ниже переменная `$data` указывает на папку с `train/`, `val/` и `test/`. Индекс NVIDIA указывается через `--gpu`.
+
+| Участник | Роль и модели | Что передаёт для сборки |
+|---|---|---|
+| 1 | `gbdt` — `history`, `category-trend`, `pixie-decays`, `strong-gbdt` | Отчёт и скоры на `val` |
+| 2 | `listwise` — `avito-joint`, `set-transformer`, `neural-pairwise` | Отчёт, скоры на `val` и OOF-скоры `avito-joint` |
+| 3 | `sequence` — `gru-din`, `sasrec` | Отчёт, скоры на `val` и OOF-скоры `gru-din` |
+
+На каждой машине из корня репозитория:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements-gpu.txt
+$data = 'C:\study\AvitoData\competition'
+```
+
+**Участник 1** запускает CatBoost.
+
+```powershell
+.\.venv\Scripts\python.exe team_runs.py job --role gbdt --data $data --output .\runs\team-gbdt --gpu 0
+```
+
+**Участники 2 и 3** дополнительно устанавливают зависимости нейросетей. Ту же установку выполняет участник, который будет собирать ансамбль.
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-experiments.txt
+.\.venv\Scripts\python.exe -m pip install "torch==2.10.0+cu126" --index-url https://download.pytorch.org/whl/cu126
+```
+
+**Участник 2** запускает модели взаимодействия кандидатов внутри ленты.
+
+```powershell
+.\.venv\Scripts\python.exe team_runs.py job --role listwise --data $data --output .\runs\team-listwise --gpu 0
+```
+
+**Участник 3** запускает модели последовательности действий.
+
+```powershell
+.\.venv\Scripts\python.exe team_runs.py job --role sequence --data $data --output .\runs\team-sequence --gpu 0
+```
+
+Если запуск прервался после создания отчёта, повторите ту же команду с `--resume`.
+
+Для сборки передайте внутри команды `job.json`, `report.json`, файлы `<модель>/val_predictions.parquet` и каталоги `oof/` от двух нейросетевых ролей. Для последующего предсказания сохраните также веса моделей и файлы `behavior.npz`. Храните эти результаты отдельно от публичного репозитория.
+
+`team_runs.py merge` можно запустить на любой из трёх машин после получения результатов. С флагом `--stack` эта машина дополнительно обучит финальный CatBoost на двух OOF-скорах.
+
+```powershell
+.\.venv\Scripts\python.exe team_runs.py merge --data $data --runs .\runs\team-gbdt .\runs\team-listwise .\runs\team-sequence --output .\runs\team-merged --gpu 0 --stack
+```
+
+Сборка проверяет состав и порядок выбранных лент, бюджет обучения и пары `(feed_id, item_id)`, затем сравнивает Z-блендинг, RRF, штраф за повтор категории и стекинг на общей `val`.
+
+### Отчёты команды на GitHub
+
+Каждый участник заполняет свой файл и открывает отдельный PR в `main`.
+
+- Участник 1 — [форма GBDT](reports/gbdt.md)
+- Участник 2 — [форма listwise](reports/listwise.md)
+- Участник 3 — [форма последовательных моделей](reports/sequence.md)
+
+Числа берите из таблицы `models` в `report.json`. Для полной NDCG используйте поля `tuning.ndcg`, `holdout.ndcg` и `val.ndcg`. Время и пик RAM указаны в `seconds` и `peak_ram_mib`. Если модель завершилась с ошибкой, запишите этап и сообщение вместо метрики. Участники 2 и 3 также отмечают наличие OOF-файла и число лент с OOF-скорами. В GitHub добавляйте заполненную форму, а файлы со скорами передавайте сборщику внутри команды.
+
 ## Окно обучения на GPU
 
 ```powershell

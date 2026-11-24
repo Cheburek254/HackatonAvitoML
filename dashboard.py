@@ -47,6 +47,12 @@ class Dashboard:
         self.cancelled = False
         self.report_path = None
         self.report_stamp = None
+        self.watch_config = None
+        self.watch_stamp = None
+        self.watch_log = None
+        self.watch_status = None
+        self.watch_offset = 0
+        self.watch_active = False
         self.result_rows = {}
         self.models, self.completed, self.curve = [], set(), []
         self.gpus = {}
@@ -271,6 +277,8 @@ class Dashboard:
         self.root.destroy()
 
     def poll(self):
+        if self.watch_config is not None:
+            self.poll_watch()
         while True:
             try:
                 kind, value = self.events.get_nowait()
@@ -289,6 +297,42 @@ class Dashboard:
             except (OSError, ValueError):
                 pass
         self.root.after(160, self.poll)
+
+    def poll_watch(self):
+        try:
+            stamp = self.watch_config.stat().st_mtime_ns
+            if stamp != self.watch_stamp:
+                job = json.loads(self.watch_config.read_text(encoding="utf-8"))
+                self.report_path, self.report_stamp = Path(job["report"]), None
+                self.watch_log, self.watch_status = Path(job["log"]), Path(job["status"])
+                self.data.set(job["data"])
+                self.models, self.completed, self.curve = job["models"], set(), []
+                self.budget = job["iterations"], job["epochs"]
+                self.watch_offset = 0
+                self.watch_active = True
+                self.progress.set(0)
+                self.model_progress.set(0)
+                self.status.set("Ожидание запуска")
+                self.stage.set("")
+                self.clear_log()
+                self.table.delete(*self.table.get_children())
+                self.draw_curve()
+                self.start.configure(state="disabled")
+                self.watch_stamp = stamp
+            if self.watch_log and self.watch_log.is_file():
+                with self.watch_log.open("rb") as log:
+                    log.seek(self.watch_offset)
+                    chunk = log.read()
+                end = chunk.rfind(b"\n") + 1
+                self.watch_offset += end
+                for line in chunk[:end].decode("utf-8", errors="replace").splitlines():
+                    self.on_line(line)
+            if self.watch_active and self.watch_status.is_file():
+                code = int(self.watch_status.read_text(encoding="utf-8").strip())
+                self.watch_active = False
+                self.finished(code)
+        except (OSError, ValueError, KeyError):
+            pass
 
     def on_line(self, line):
         self.append(line)
@@ -383,7 +427,7 @@ class Dashboard:
                               tags=("best",) if index == 0 else ())
 
     def select_result(self, _):
-        if not self.running and self.table.selection():
+        if not self.running and not self.watch_active and self.table.selection():
             row = self.result_rows[self.table.selection()[0]]
             self.curve = row.get("tuning_curve", [])
             self.stage.set(row["model"])
@@ -417,9 +461,11 @@ class Dashboard:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--report", type=Path, help="Open an existing benchmark report on launch")
+    parser.add_argument("--watch", type=Path, help="Watch an externally launched experiment")
     options = parser.parse_args()
     window = tk.Tk()
     app = Dashboard(window)
+    app.watch_config = options.watch
     if options.report:
         app.load_report(options.report)
     window.mainloop()

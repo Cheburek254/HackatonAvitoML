@@ -41,18 +41,18 @@ def fit(embeddings, indices, device):
     return centers
 
 
-def assign(embeddings, centers, device):
-    ids = np.full(len(embeddings), -1, dtype=np.int16)
-    similarity = np.zeros(len(embeddings), dtype=np.float32)
+def assign(embeddings, centers, device, indices):
+    ids = np.full(len(indices), -1, dtype=np.int16)
+    similarity = np.zeros(len(indices), dtype=np.float32)
     if not len(centers):
-        return ids, similarity
+        return indices, ids, similarity
     if device == "gpu":
         from accelerator import cuda_tensor
 
         tensor = cuda_tensor()
         prototypes = tensor(centers.T.copy(), device="CUDA").realize()
     for start in range(0, len(ids), 8192):
-        values = np.asarray(embeddings[start:start + 8192], dtype=np.float32)
+        values = np.asarray(embeddings[indices[start:start + 8192]], dtype=np.float32)
         if device == "gpu":
             x = tensor(values, device="CUDA")
             x = x / x.square().sum(axis=1, keepdim=True).sqrt().maximum(1e-6)
@@ -64,18 +64,19 @@ def assign(embeddings, centers, device):
         batch = slice(start, start + len(values))
         ids[batch] = np.where(np.any(values != 0, axis=1), closest, -1)
         similarity[batch] = scores
-    return ids, similarity
+    return indices, ids, similarity
 
 
 def history_match(indices, history, assignment):
-    clusters, similarity = assignment
+    embedded_ids, clusters, similarity = assignment
     item_ids = np.full(len(indices), -1, dtype=np.int16)
     valid = indices >= 0
-    item_ids[valid] = clusters[indices[valid]]
+    item_positions = np.searchsorted(embedded_ids, indices[valid])
+    item_ids[valid] = clusters[item_positions]
     history = history[history >= 0]
-    available = clusters[history]
+    available = clusters[np.searchsorted(embedded_ids, history)]
     available = available[available >= 0]
     shares = ((item_ids[:, None] == available).sum(axis=1) / max(len(available), 1)).astype(np.float32)
     cosine = np.zeros(len(indices), dtype=np.float32)
-    cosine[valid] = similarity[indices[valid]]
+    cosine[valid] = similarity[item_positions]
     return item_ids, shares, cosine

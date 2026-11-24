@@ -3,6 +3,7 @@
 import argparse
 import json
 from pathlib import Path
+from time import perf_counter
 
 import numpy as np
 import polars as pl
@@ -12,7 +13,7 @@ from torch.nn import functional as F
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset, Subset
 
-from evaluation import KEYS, attach_scores, ndcg
+from evaluation import KEYS, attach_scores, ndcg, peak_ram_mib
 from ranker import BASE_FEATURES, CANDIDATE_COLUMNS, HISTORY_COLUMNS, feed_batches, open_embeddings
 
 VARIANTS = ("transformer", "transformer-listmle", "avito-joint", "neural-din", "bst", "gru-din", "sasrec",
@@ -198,6 +199,22 @@ def labels(dataset):
     return dataset.feeds.select(*KEYS, "target").explode("item_id", "target")
 
 
+def train_epoch(model, optimizer, batches, device, variant, epoch):
+    start = perf_counter()
+    model.train()
+    for step, (_, _, inputs, target) in enumerate(batches, start=1):
+        optimizer.zero_grad(set_to_none=True)
+        inputs = tuple(tensor.to(device) for tensor in inputs)
+        loss = loss_for(variant, model(*inputs), target.to(device), inputs[3])
+        loss.backward()
+        optimizer.step()
+        if step == 1 or step == len(batches) or step % 100 == 0:
+            print(f"{variant} epoch={epoch} batch={step}/{len(batches)} loss={loss.detach().item():.6f}", flush=True)
+    seconds = round(perf_counter() - start, 2)
+    print(f"{variant} epoch={epoch} training_seconds={seconds:.2f}", flush=True)
+    return seconds
+
+
 def train(args):
     if args.output.exists():
         raise FileExistsError(args.output)
@@ -216,16 +233,23 @@ def train(args):
         tune_batches = loader(Subset(val_set, indices.tolist()), args.batch_size)
     model = Ranker(args.variant).to(args.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.0001)
-    best, best_epoch, best_state = -1, 0, None
+    best, best_epoch, best_state, curve = -1, 0, None, []
+    epoch_seconds = []
+    tuning_slates = None
+    if args.device == "cuda":
+        from ensemble import Slates
+
+        tuning_slates = Slates(tune_labels, args.device)
     for epoch in range(1, args.epochs + 1):
-        model.train()
-        for _, _, inputs, target in train_batches:
-            optimizer.zero_grad()
-            inputs = tuple(tensor.to(args.device) for tensor in inputs)
-            loss = loss_for(args.variant, model(*inputs), target.to(args.device), inputs[3])
-            loss.backward()
-            optimizer.step()
-        metric = ndcg(attach_scores(tune_labels, scores(model, tune_batches, args.device)))["ndcg"]
+        epoch_seconds.append(train_epoch(model, optimizer, train_batches, args.device, args.variant, epoch))
+        predicted = scores(model, tune_batches, args.device)
+        if tuning_slates is None:
+            metric = ndcg(attach_scores(tune_labels, predicted))["ndcg"]
+        else:
+            aligned = attach_scores(tuning_slates.frame, predicted).sort(["feed_id", "target", "item_id"])
+            values = torch.as_tensor(aligned["score"].to_numpy()[tuning_slates.rows], device=args.device)
+            metric = tuning_slates.metric(values)
+        curve.append([epoch, metric])
         print(f"{args.variant} epoch={epoch} tuning_ndcg={metric:.6f}", flush=True)
         if metric > best:
             best, best_epoch = metric, epoch
@@ -233,11 +257,38 @@ def train(args):
     model.load_state_dict(best_state)
     predictions = scores(model, loader(val_set, args.batch_size), args.device)
     report = {f"val_{name}": value for name, value in ndcg(attach_scores(val_labels, predictions)).items()}
-    report.update(variant=args.variant, best_epoch=best_epoch, tune_before=args.tune_before)
+    report.update(variant=args.variant, best_epoch=best_epoch, tune_before=args.tune_before, tuning_curve=curve,
+                  epoch_seconds=epoch_seconds, peak_ram_mib=peak_ram_mib())
     args.output.mkdir(parents=True)
     torch.save({"state_dict": best_state, "variant": args.variant, "history_window": args.history_window}, args.output / "model.pt")
     predictions.write_parquet(args.output / "val_predictions.parquet")
     (args.output / "metrics.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+
+
+def oof(args):
+    if args.output.exists():
+        raise FileExistsError(args.output)
+    dataset = Feeds(args.data / "train", args.train_feeds, True, args.history_window, args.variant in HISTORY_VARIANTS)
+    timestamps = dataset.feeds["timestamp"].to_numpy()
+    unique = np.unique(timestamps)
+    if len(unique) < 3:
+        raise ValueError("OOF needs at least three distinct timestamps")
+    bounds = (*[int(unique[len(unique) * index // 3]) for index in (1, 2)], int(unique[-1]) + 1)
+    chunks = []
+    for first, end in zip(bounds[:-1], bounds[1:], strict=True):
+        fit_rows = np.flatnonzero(timestamps < first)
+        score_rows = np.flatnonzero((timestamps >= first) & (timestamps < end))
+        print(f"OOF {args.variant}: {len(fit_rows)} past feeds, {len(score_rows)} future feeds", flush=True)
+        torch.manual_seed(42)
+        model = Ranker(args.variant).to(args.device)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=.001, weight_decay=.0001)
+        training = loader(Subset(dataset, fit_rows.tolist()), args.batch_size, shuffle=True)
+        for epoch in range(1, args.epochs + 1):
+            train_epoch(model, optimizer, training, args.device, args.variant, epoch)
+        predictions = loader(Subset(dataset, score_rows.tolist()), args.batch_size)
+        chunks.append(scores(model, predictions, args.device))
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    pl.concat(chunks).write_parquet(args.output)
 
 
 def predict(args):
@@ -265,10 +316,16 @@ def main():
     training.add_argument("--history-window", type=int, default=32)
     training.add_argument("--tune-before", type=int)
     training.set_defaults(run=train)
+    oof_command = commands.add_parser("oof")
+    oof_command.add_argument("--variant", choices=VARIANTS, required=True)
+    oof_command.add_argument("--epochs", type=int, default=2)
+    oof_command.add_argument("--train-feeds", type=int, default=50_000)
+    oof_command.add_argument("--history-window", type=int, default=32)
+    oof_command.set_defaults(run=oof)
     prediction = commands.add_parser("predict")
     prediction.add_argument("--model", type=Path, required=True)
     prediction.set_defaults(run=predict)
-    for command in (training, prediction):
+    for command in (training, oof_command, prediction):
         command.add_argument("--data", type=Path, required=True)
         command.add_argument("--output", type=Path, required=True)
         command.add_argument("--batch-size", type=int, default=16)
@@ -280,6 +337,10 @@ def main():
     if not 1 <= getattr(args, "history_window", 1) <= 256 or min(getattr(args, "train_feeds", 0), getattr(args, "val_feeds", 0)) < 0:
         parser.error("History window must be 1–256 and feed limits must be nonnegative")
     torch.set_num_threads(args.threads)
+    if args.device == "cuda":
+        if not torch.cuda.is_available():
+            parser.error("CUDA PyTorch is required for --device cuda")
+        torch.set_float32_matmul_precision("high")
     args.run(args)
 
 

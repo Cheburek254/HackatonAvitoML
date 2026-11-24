@@ -11,7 +11,7 @@ from catboost import CatBoost, CatBoostRanker, Pool
 
 import behavior
 import embedding_clusters
-from evaluation import KEYS, NDCG, attach_scores, ndcg, peak_ram_mib
+from evaluation import KEYS, NDCG, attach_scores, ndcg, peak_ram_mib, zscore
 
 BASE_FEATURES = ["f1", "f2", "f3", "f4", "f5"]
 CANDIDATE_COLUMNS = ["item_id", "category_id", *BASE_FEATURES, "item_id__embedding_idx"]
@@ -40,6 +40,11 @@ VARIANTS = {
     "history-distill": FEATURES,
     "category-trend-pixie": [*FEATURES, *CATEGORY_TREND_FEATURES, *behavior.FEATURES["pixie"]],
 }
+VARIANTS["strong-gbdt"] = [*FEATURES, *CATEGORY_TREND_FEATURES, *SIM_FEATURES, *behavior.FEATURES["strong-gbdt"]]
+STACK_FEATURES = ["stack_joint_z", "stack_gru_z"]
+STACK_VARIANTS = ("stack-base", "stack-gbdt")
+VARIANTS["stack-base"] = VARIANTS["strong-gbdt"]
+VARIANTS["stack-gbdt"] = [*VARIANTS["strong-gbdt"], *STACK_FEATURES]
 RECENT_EVENTS = 32
 HISTORY_WEIGHTS = np.exp2(-np.arange(RECENT_EVENTS, dtype=np.float32) / 8)
 
@@ -211,7 +216,15 @@ def candidate_batches(split, *, features=FEATURES, labeled=False, max_feeds=0,
     if after is not None or before is not None:
         columns.append("timestamp")
     embeddings = open_embeddings(split)
-    clusters = embedding_clusters.assign(embeddings, centers, device) if centers is not None else None
+    clusters = None
+    if centers is not None:
+        candidate_key = "item_id__embedding_idx"
+        history_key = "history__item_id__embedding_idx"
+        batches = feed_batches(split, [candidate_key, history_key], max_feeds)
+        indices = np.unique(np.concatenate([
+            batch[key].explode().unique().to_numpy() for batch in batches for key in (candidate_key, history_key)
+        ]))
+        clusters = embedding_clusters.assign(embeddings, centers, device, indices[indices >= 0].astype(np.intp))
     for batch in feed_batches(split, columns, max_feeds):
         if after is not None:
             batch = batch.filter(pl.col("timestamp") >= after)
@@ -278,9 +291,9 @@ def raw_scores(model, pool, threads, device):
 
 
 def select_gpu_checkpoint(model, tuning, val_pool, args):
-    from accelerator import GpuNDCG
+    from accelerator import gpu_ndcg_evaluator
 
-    metric = GpuNDCG(tuning)
+    metric = gpu_ndcg_evaluator(tuning)
     step = max(1, min(5, args.iterations // 20))
     checkpoints = sorted({1, model.tree_count_, *range(step, model.tree_count_, step)})
     best_ndcg, best_tree, curve = -1, 1, []
@@ -326,6 +339,16 @@ def distillation_targets(args, training):
     ).drop("teacher")
 
 
+def with_stack_scores(frame, predictions, *, train=False):
+    sources = [pl.read_parquet(path, columns=[*KEYS, "score"]) for path in predictions]
+    if train:
+        frame = frame.filter(pl.col("feed_id").is_in(sources[0]["feed_id"].unique()))
+    for name, source in zip(STACK_FEATURES, sources, strict=True):
+        values = attach_scores(frame.select(KEYS), source).with_columns(zscore("score").alias(name)).drop("score")
+        frame = frame.join(values, on=KEYS, validate="1:1")
+    return frame.sort("feed_id", maintain_order=True)
+
+
 def train(args):
     if args.output.exists():
         raise FileExistsError(args.output)
@@ -336,10 +359,14 @@ def train(args):
     training, reference = load_training(args, features, centers)
     if args.variant == "history-distill":
         training = distillation_targets(args, training)
+    if args.variant in STACK_VARIANTS:
+        training = with_stack_scores(training, args.stack_train, train=True)
     train_pool = make_pool(training, features, args.threads, labeled=True)
     del training
     val = read_candidates(args.data / "val", features=features, labeled=True, max_feeds=args.val_feeds,
                           reference=reference, centers=centers, device=args.device)
+    if args.variant == "stack-gbdt":
+        val = with_stack_scores(val, args.stack_val)
     tuning = val
     if args.tune_before is not None:
         tune_ids = pl.concat(list(feed_batches(args.data / "val", ["feed_id", "timestamp"], args.val_feeds)))
@@ -399,11 +426,15 @@ def predict(args):
     kind = behavior.reference_kind(model.feature_names_)
     reference = behavior.Reference.load(kind, args.model.with_name("behavior.npz")) if kind else None
     centers = np.load(args.model.with_name("centers.npy"), allow_pickle=False) if CLUSTER_FEATURES[0] in model.feature_names_ else None
-    predictions = pl.concat([
-        score_batch(model, batch, args.threads, args.device)
-        for batch in candidate_batches(args.data / "test", features=model.feature_names_, reference=reference,
-                                       centers=centers, device=args.device)
-    ])
+    batches = candidate_batches(args.data / "test", features=model.feature_names_, reference=reference,
+                                centers=centers, device=args.device)
+    if STACK_FEATURES[0] in model.feature_names_:
+        if not args.stack_predictions:
+            raise ValueError("stack-gbdt needs avito-joint and gru-din test scores in --stack-predictions")
+        candidates = with_stack_scores(pl.concat(list(batches)), args.stack_predictions)
+        predictions = score_batch(model, candidates, args.threads, args.device)
+    else:
+        predictions = pl.concat([score_batch(model, batch, args.threads, args.device) for batch in batches])
     submission = attach_scores(template, predictions)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -420,9 +451,12 @@ def main():
     training.add_argument("--iterations", type=int, default=500)
     training.add_argument("--variant", choices=VARIANTS, default="history")
     training.add_argument("--tune-before", type=int, help="Use only validation feeds strictly before this Unix time for early stopping")
+    training.add_argument("--stack-train", nargs=2, type=Path, metavar=("JOINT", "GRU"))
+    training.add_argument("--stack-val", nargs=2, type=Path, metavar=("JOINT", "GRU"))
     training.set_defaults(run=train)
     scoring = commands.add_parser("predict")
     scoring.add_argument("--model", type=Path, required=True)
+    scoring.add_argument("--stack-predictions", nargs=2, type=Path, metavar=("JOINT", "GRU"))
     scoring.set_defaults(run=predict)
     for command in (training, scoring):
         command.add_argument("--data", type=Path, required=True)
@@ -438,6 +472,10 @@ def main():
         parser.error("Threads and iterations must be positive")
     if getattr(args, "variant", None) == "lambda" and args.device != "cpu":
         parser.error("CatBoost LambdaMart supports CPU training")
+    if getattr(args, "variant", None) in STACK_VARIANTS and (
+        not args.stack_train or (args.variant == "stack-gbdt" and not args.stack_val)
+    ):
+        parser.error("Stack variants require --stack-train; stack-gbdt also requires --stack-val")
     if args.gpu_id:
         from accelerator import select_gpu
 

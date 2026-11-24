@@ -9,6 +9,12 @@ KEYS = ["feed_id", "item_id"]
 NDCG = "NDCG:type=Base"
 
 
+def zscore(column):
+    values = pl.col(column)
+    deviation = values.std(ddof=0).over("feed_id")
+    return ((values - values.mean().over("feed_id")) / (deviation + 1e-6)).cast(pl.Float32)
+
+
 def peak_ram_mib():
     if sys.platform == "win32":
         import ctypes

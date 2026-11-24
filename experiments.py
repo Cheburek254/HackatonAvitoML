@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+from shutil import copytree
 import subprocess
 import sys
 import zipimport
@@ -14,12 +15,13 @@ import numpy as np
 import polars as pl
 
 from evaluation import KEYS, attach_scores, blend, ndcg
-from ranker import VARIANTS, feed_batches
+from ranker import STACK_VARIANTS, VARIANTS, feed_batches
 
 NEURAL = ("transformer", "transformer-listmle", "avito-joint", "neural-din", "bst", "gru-din", "sasrec",
           "set-transformer", "neural-pairwise")
 OFFICIAL = ("avito-catboost", "avito-transformer")
 CUDA_NEURAL = ("dual-history",)
+TREE_MODELS = tuple(name for name in VARIANTS if name not in STACK_VARIANTS)
 GPU_ABLATION = ("history", "category-trend", "category-trend-wide", "category-model", "popularity-trend",
                 "category-covis", "pixie-decays", "covis-pixie", "embedding-clusters", "history-distill", *CUDA_NEURAL)
 
@@ -32,14 +34,14 @@ def read_frame(data, split, columns, limit):
 
 
 def validation(data, limit):
-    columns = ["feed_id", "item_id", "target", "timestamp", "history__item_id"]
+    columns = ["feed_id", "item_id", "category_id", "target", "timestamp", "history__item_id"]
     feeds = read_frame(data, "val", columns, limit)
     timestamps = feeds["timestamp"].unique().sort()
     if len(timestamps) < 2:
         raise ValueError("Benchmark needs at least two distinct validation timestamps")
     cutoff = int(timestamps[len(timestamps) // 2])
     labels = feeds.with_columns(pl.col("history__item_id").list.len().alias("history_length")).drop("history__item_id")
-    return labels.explode("item_id", "target"), cutoff
+    return labels.explode("item_id", "category_id", "target"), cutoff
 
 
 def organizer_module(archive, name):
@@ -72,6 +74,44 @@ def official_catboost(args, tune_ids, output):
     return baseline.predict_scores(candidates, model)
 
 
+def fit_archive_transformer_cuda(baseline, training, tuning, output, config):
+    import torch
+    from torch.nn.functional import binary_cross_entropy_with_logits
+
+    output.mkdir(parents=True, exist_ok=False)
+    torch.set_num_threads(config["threads"])
+    torch.manual_seed(config["seed"])
+    model_params = {key: config[key] for key in ("width", "layers", "dropout")}
+    model = baseline.Ranker(len(training.categories_mapping), **model_params).cuda()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config["learning_rate"], weight_decay=config["weight_decay"])
+    train = baseline.DataLoader(training, batch_size=config["batch_size"], shuffle=True, collate_fn=baseline.collate_feeds)
+    validation = baseline.DataLoader(tuning, batch_size=config["batch_size"], collate_fn=baseline.collate_feeds)
+
+    def batch_loss(batch):
+        features, categories, users, padding, target = (tensor.cuda() for tensor in batch)
+        logits = model(features, categories, users, padding)
+        # Static masking preserves the archive's BCE over valid rows and avoids CUDA boolean indexing in backward.
+        loss = binary_cross_entropy_with_logits(logits, target, reduction="none")
+        return loss.masked_fill(padding, 0).sum(), (~padding).sum()
+
+    history, best = [], float("inf")
+    for epoch in range(1, config["epochs"] + 1):
+        model.train()
+        train_sum = 0.
+        for batch in train:
+            optimizer.zero_grad(set_to_none=True)
+            summed, count = batch_loss(batch)
+            (summed / count).backward()
+            optimizer.step()
+            train_sum += summed.item()
+        model.eval()
+        with torch.inference_mode():
+            val_sum = sum(batch_loss(batch)[0].item() for batch in validation)
+        metrics = {"epoch": epoch, "train_logloss": train_sum / len(training.keys), "val_logloss": val_sum / len(tuning.keys)}
+        best = baseline.save_epoch(model, training, tuning, output, config, metrics, history, best)
+        print(f"avito-transformer epoch={epoch} val_logloss={metrics['val_logloss']:.6f}", flush=True)
+
+
 def official_transformer(args, tune_ids, output):
     import torch
     from torch.utils.data import Subset
@@ -84,7 +124,10 @@ def official_transformer(args, tune_ids, output):
     tuning.keys = val.keys.filter(val.keys["feed_id"].is_in(tune_ids))
     config = {**baseline.TRAIN_CONFIG, "device": args.neural_device, "epochs": args.epochs,
               "threads": args.threads, "batch_size": args.batch_size}
-    baseline.fit(training, tuning, output, config)
+    if args.neural_device == "cuda":
+        fit_archive_transformer_cuda(baseline, training, tuning, output, config)
+    else:
+        baseline.fit(training, tuning, output, config)
     checkpoint = torch.load(output / "model.pt", map_location="cpu", weights_only=True)
     model = baseline.Ranker(len(training.categories_mapping), **checkpoint["model_params"]).to(args.neural_device)
     model.load_state_dict(checkpoint["state_dict"])
@@ -98,7 +141,7 @@ def official_transformer(args, tune_ids, output):
     return val.keys.with_columns(pl.Series("score", np.concatenate(predictions), dtype=pl.Float32))
 
 
-def run_model(args, name, output, tune_ids, cutoff):
+def run_model(args, name, output, tune_ids, cutoff, extra=()):
     if name in OFFICIAL:
         runner = official_catboost if name == "avito-catboost" else official_transformer
         predictions = runner(args, tune_ids, output)
@@ -120,7 +163,7 @@ def run_model(args, name, output, tune_ids, cutoff):
     else:
         command.extend(["--epochs", str(args.epochs), "--batch-size", str(args.batch_size),
                         "--device", args.neural_device, "--history-window", str(args.history_window)])
-    subprocess.run(command, check=True)
+    subprocess.run([*command, *extra], check=True)
     return pl.read_parquet(output / "val_predictions.parquet")
 
 
@@ -187,6 +230,49 @@ def pareto_models(results):
     ]
 
 
+def import_results(args, report, labels, results, files):
+    for directory in args.reuse_models_from:
+        previous = json.loads((directory / "report.json").read_text(encoding="utf-8"))
+        fields = ("val_feeds", "val_candidates", "tuning_cutoff_timestamp", "train_feed_limit", "iterations", "gpu")
+        if (Path(previous["data"]).resolve() != args.data.resolve() or not previous["complete"]
+                or any(previous.get(field) != report[field] for field in fields)):
+            raise ValueError(f"Incompatible source for reusing trained models: {directory}")
+        for row in previous["models"]:
+            name = row["model"]
+            supported = (*TREE_MODELS, *CUDA_NEURAL, "avito-catboost")
+            if name not in args.models or name in files or name not in supported:
+                continue
+            if name in CUDA_NEURAL and previous["epochs"] != args.epochs:
+                raise ValueError(f"Incompatible neural epoch budget in {directory}")
+            source = directory / name
+            predictions = source / "val_predictions.parquet"
+            attach_scores(labels, pl.read_parquet(predictions))
+            destination = args.output / name
+            copytree(source, destination)
+            files[name] = destination / predictions.name
+            results.append({**row, "reused_from": str(directory)})
+            print(f"Reusing {name} from {directory}", flush=True)
+
+
+def fit_stack_models(args, tune_ids, cutoff, files):
+    oof_paths = []
+    teachers = ("avito-joint", "gru-din")
+    for teacher in teachers:
+        path = args.output / "oof" / f"{teacher}.parquet"
+        oof_paths.append(str(path))
+        if not path.is_file():
+            script = Path(__file__).with_name("neural.py")
+            subprocess.run([
+                sys.executable, "-u", "-X", "utf8", str(script), "oof", "--variant", teacher, "--data", str(args.data),
+                "--output", str(path), "--train-feeds", str(args.train_feeds), "--batch-size", str(args.batch_size),
+                "--epochs", str(args.epochs), "--threads", str(args.threads), "--device", args.neural_device,
+                "--history-window", str(args.history_window),
+            ], check=True)
+    extra = ["--stack-train", *oof_paths, "--stack-val", *[str(files[teacher]) for teacher in teachers]]
+    for name in STACK_VARIANTS:
+        yield name, extra
+
+
 def benchmark(args):
     metric = ndcg
     selected = None
@@ -226,7 +312,9 @@ def run_benchmark(args, labels, cutoff, tune_ids, metric, selected):
     options = {"by_category": args.by_category, "history_window": args.history_window, "threads": args.threads,
                "batch_size": args.batch_size, "dual_batch_size": args.dual_batch_size,
                "cat_device": args.cat_device, "neural_device": args.neural_device,
-               "baseline_zip": str(args.baseline_zip) if args.baseline_zip else None}
+               "baseline_zip": str(args.baseline_zip) if args.baseline_zip else None,
+               "family_blends": args.family_blends, "stack": args.stack, "optuna_trials": args.optuna_trials,
+               "reuse_models_from": [str(path) for path in args.reuse_models_from], "no_rrf": args.no_rrf}
     report_path = args.output / "report.json"
     if args.resume:
         previous = json.loads(report_path.read_text(encoding="utf-8"))
@@ -240,29 +328,46 @@ def run_benchmark(args, labels, cutoff, tune_ids, metric, selected):
         print(f"Resuming with {len(results)} completed models", flush=True)
     report["options"] = options
     groups = category_groups(args, cutoff) if args.by_category else None
+    import_results(args, report, labels, results, files)
     save_report(report_path, report, results)
-    for name in args.models:
+
+    def train_model(name, extra=()):
         if name in files:
-            continue
+            return
         start = perf_counter()
         print(f"Starting {name}", flush=True)
         output = args.output / name
         if args.resume and output.exists():
             output.rename(output.with_name(f".incomplete-{name}-{uuid4().hex[:8]}"))
-        predictions = run_model(args, name, output, tune_ids, cutoff)
+        predictions = run_model(args, name, output, tune_ids, cutoff, extra)
         scores = score_summary(attach_scores(labels, predictions), cutoff, metric, groups)
         metrics_path = output / "metrics.json"
         stats = json.loads(metrics_path.read_text(encoding="utf-8")) if metrics_path.is_file() else {}
         results.append({"model": name, **scores, "seconds": round(perf_counter() - start, 2),
-                        **{key: stats[key] for key in ("peak_ram_mib", "tuning_curve") if key in stats}})
+                        **{key: stats[key] for key in ("peak_ram_mib", "tuning_curve", "epoch_seconds") if key in stats}})
         files[name] = output / "val_predictions.parquet"
         save_report(report_path, report, results)
         print(f"Finished {name}: holdout_ndcg={scores['holdout']['ndcg']:.8f}", flush=True)
-    if len(results) >= 2:
+
+    for name in args.models:
+        train_model(name)
+    if args.stack:
+        print("Preparing out-of-fold neural predictions for stacking", flush=True)
+        for name, extra in fit_stack_models(args, tune_ids, cutoff, files):
+            train_model(name, extra)
+    if len(results) >= 2 and not args.no_rrf:
         print("Fitting RRF on early validation", flush=True)
         result, predictions = fit_blend(labels, cutoff, results, files, metric, groups)
         results.append(result)
         predictions.write_parquet(args.output / "rrf_val_predictions.parquet")
+    if args.family_blends:
+        from ensemble import fit_families
+
+        for name, predictions, metadata in fit_families(labels, cutoff, results, files, args.neural_device, args.optuna_trials):
+            scores = score_summary(attach_scores(labels, predictions), cutoff, metric, groups)
+            results.append({"model": name, **metadata, **scores})
+            predictions.write_parquet(args.output / f"{name}_val_predictions.parquet")
+            save_report(report_path, report, results)
     report["complete"] = True
     report["pareto"] = pareto_models(results)
     save_report(report_path, report, results)
@@ -301,7 +406,7 @@ def main():
     commands = parser.add_subparsers(required=True)
     run = commands.add_parser("benchmark")
     run.add_argument("--output", type=Path, required=True)
-    run.add_argument("--models", choices=(*OFFICIAL, *VARIANTS, *NEURAL, *CUDA_NEURAL), nargs="+")
+    run.add_argument("--models", choices=(*OFFICIAL, *TREE_MODELS, *NEURAL, *CUDA_NEURAL), nargs="+")
     run.add_argument("--baseline-zip", type=Path)
     run.add_argument("--iterations", type=int, default=500)
     run.add_argument("--epochs", type=int, default=5)
@@ -314,6 +419,11 @@ def main():
     run.add_argument("--gpu", help="Use the selected NVIDIA GPU for training and NDCG (index or UUID)")
     run.add_argument("--by-category", action="store_true")
     run.add_argument("--resume", action="store_true", help="Reuse completed models in a stopped benchmark")
+    run.add_argument("--reuse-models-from", nargs="+", type=Path, default=[], metavar="RUN")
+    run.add_argument("--family-blends", action="store_true")
+    run.add_argument("--stack", action="store_true")
+    run.add_argument("--optuna-trials", type=int, default=48)
+    run.add_argument("--no-rrf", action="store_true")
     run.set_defaults(action=benchmark)
     diagnostic = commands.add_parser("diagnose")
     diagnostic.set_defaults(action=diagnose)
@@ -333,13 +443,18 @@ def main():
         parser.error("Feed limits must be nonnegative")
     if args.action == benchmark:
         args.models = args.models or (list(GPU_ABLATION) if args.gpu is not None else
-                                      [*OFFICIAL, *VARIANTS, *NEURAL] if args.baseline_zip else list(VARIANTS))
+                                      [*OFFICIAL, *TREE_MODELS, *NEURAL] if args.baseline_zip else list(TREE_MODELS))
         if args.gpu is not None:
             if "lambda" in args.models or "als" in args.models:
                 parser.error("This GPU benchmark excludes CPU-only lambda and als")
             args.cat_device, args.neural_device = "gpu", "cuda"
         if set(CUDA_NEURAL) & set(args.models) and args.gpu is None:
             parser.error("dual-history requires --gpu")
+        if args.stack and not {"avito-joint", "gru-din"}.issubset(args.models):
+            parser.error("--stack requires avito-joint and gru-din")
+        if args.family_blends and ("strong-gbdt" not in args.models or not {"avito-joint", "set-transformer", "neural-pairwise"}.intersection(args.models)
+                                   or not {"gru-din", "sasrec"}.intersection(args.models)):
+            parser.error("--family-blends needs strong-gbdt, a listwise model, and a sequence model")
         if len(set(args.models)) != len(args.models) or set(OFFICIAL) & set(args.models) and not args.baseline_zip:
             parser.error("Models must be unique and official models require --baseline-zip")
         if min(args.batch_size, args.dual_batch_size, args.epochs, args.iterations, args.threads) < 1 or not 1 <= args.history_window <= 256:

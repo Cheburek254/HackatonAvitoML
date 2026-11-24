@@ -20,6 +20,8 @@ FEATURES = {
         "covis_max", "covis_recency_weighted", "covis_supported", "pixie_score", "pixie_neighbors"
     )],
 }
+COMBINED_REFERENCES = ("covis-pixie", "popularity-trend", "category-model")
+FEATURES["strong-gbdt"] = [f"strong_{name}" for kind in COMBINED_REFERENCES for name in FEATURES[kind]]
 HISTORY_WINDOW = 8
 PIXIE_FRONTIER = 256
 CATEGORY_ONE_HOT = np.eye(256, dtype=np.float32)
@@ -98,6 +100,13 @@ def fit_category_model(feeds, device):
 
 
 def fit(kind, feeds, threads, device="cpu"):
+    if kind == "strong-gbdt":
+        arrays = {
+            f"{part}:{key}": values
+            for part in COMBINED_REFERENCES
+            for key, values in fit(part, feeds, threads, device).arrays.items()
+        }
+        return Reference(kind, arrays)
     if kind in {"covis", "category-covis"}:
         return Reference(kind, {"edges": transition_counts(feeds, by_category=kind == "category-covis")})
     if kind == "covis-pixie":
@@ -214,6 +223,12 @@ class Reference:
     def __init__(self, kind, arrays=None):
         self.kind = kind
         self.arrays = arrays if arrays is not None else {}
+        if kind == "strong-gbdt" and self.arrays:
+            self.references = [
+                Reference(part, {key.removeprefix(f"{part}:"): values for key, values in self.arrays.items()
+                                 if key.startswith(f"{part}:")})
+                for part in COMBINED_REFERENCES
+            ]
         if kind in {"pixie", "pixie-decays", "covis-pixie"} and self.arrays:
             self.graph = PixieGraph(self.arrays["pairs"])
         if kind == "popularity-trend" and self.arrays:
@@ -248,6 +263,8 @@ class Reference:
     def score(self, feed):
         if not self.arrays:
             return np.zeros((len(FEATURES[self.kind]), len(feed["item_id"])), dtype=np.float32)
+        if self.kind == "strong-gbdt":
+            return np.concatenate([reference.score(feed) for reference in self.references])
         if self.kind == "pixie":
             return self.graph.score(feed)
         if self.kind == "pixie-decays":
