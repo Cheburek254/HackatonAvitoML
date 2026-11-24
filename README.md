@@ -31,7 +31,7 @@ python -m venv .venv
 
 Сравнение запускает каждый вариант на одинаковом числе лент и проверяет совпадение всех пар `(feed_id, item_id)` на `val`. Граница настройки выбирается по медиане уникальных `timestamp`. Ленты с одинаковым временем остаются по одну сторону границы. Выбор чекпоинта и весов RRF выполняется на ранней части, выбранные варианты оцениваются на поздней. Оригинальный CatBoost использует для отбора итерации NDCG@30, оригинальный Transformer — Logloss, как в архиве. Варианты проекта выбирают чекпоинт по полной NDCG.
 
-`report.json` содержит NDCG на всей `val`, ранней и поздней частях, разбивку поздней части по длине истории и время запуска. Каждый вариант сохраняет свою модель и `val_predictions.parquet`. Для нейросетей сабмит вычисляет `neural.py predict`, а для смеси двух готовых сабмитов — `experiments.py blend`. Веса и имена моделей смеси записаны в `report.json`.
+`report.json` содержит NDCG на всей `val`, ранней и поздней частях, разбивку поздней части по длине истории и время запуска. В полях `train_feed_limit` и `val_feed_limit` сохранены запрошенные лимиты, в `train_feeds` и `val_feeds` — фактические размеры. Для стекинга число использованных лент указано и у самих моделей, поскольку скор OOF есть только у части `train`. Каждый вариант сохраняет свою модель и `val_predictions.parquet`. Для нейросетей сабмит вычисляет `neural.py predict`, а для смеси двух готовых сабмитов — `experiments.py blend`. Веса и имена моделей смеси записаны в `report.json`.
 
 `--train-feeds 0 --val-feeds 0` использует обе выборки целиком. Сначала стоит измерить расход RAM на ограниченной выборке. CatBoost читает эмбеддинги через memmap, а развёрнутые признаки для обучения собирает в RAM. Для сравнения на GPU есть `--cat-device gpu` и `--neural-device cuda`. Вариант `lambda` обучается на CPU.
 
@@ -53,45 +53,41 @@ python -m venv .venv
 
 Командный патч входит в эту версию проекта. В существующей копии обновитесь командой `git pull --ff-only`. Файл `team-training.patch`, который передавался отдельно, рассчитан на исходный коммит `46895ba` и применяется через `git apply team-training.patch`. Если патч уже применён локально, для командного запуска можно использовать новый клон `main`.
 
-Каждая машина обучает своё семейство на одинаковых лентах. По умолчанию используются первые 50 000 лент `train`, вся `val`, 120 итераций CatBoost и 3 эпохи для нейросетей. Используйте одну версию кода и один архив Авито. В примерах ниже переменная `$data` указывает на папку с `train/`, `val/` и `test/`. Индекс NVIDIA указывается через `--gpu`.
+Для сравнения семейств каждая машина обучает свои модели на одинаковых лентах. Бюджет по умолчанию — 200 000 лент `train`, все 14 423 ленты `val`, 120 итераций CatBoost и до 12 эпох для нейросетей. Это план примерно на 10 часов при последовательном выполнении трёх ролей и сборки на RTX 4060 Laptop. Такой бюджет можно менять флагами `--train-feeds`, `--val-feeds`, `--iterations` и `--epochs`. Для быстрой проверки добавьте `--train-feeds 50000 --epochs 3` ко всем трём командам. Используйте одинаковые параметры, версию кода и архив Авито. Индекс NVIDIA указывается через `--gpu`. Для полного `train` используйте запуск по частям ниже.
 
 | Участник | Роль и модели | Что передаёт для сборки |
 |---|---|---|
-| 1 | `gbdt` — `history`, `category-trend`, `pixie-decays`, `strong-gbdt` | Отчёт и скоры на `val` |
-| 2 | `listwise` — `avito-joint`, `set-transformer`, `neural-pairwise` | Отчёт, скоры на `val` и OOF-скоры `avito-joint` |
-| 3 | `sequence` — `gru-din`, `sasrec` | Отчёт, скоры на `val` и OOF-скоры `gru-din` |
+| Кирилл | `gbdt` — `history`, `category-trend`, `pixie-decays`, `strong-gbdt` | Отчёт и скоры на `val` |
+| Савва | `listwise` — `avito-joint`, `set-transformer`, `neural-pairwise` | Отчёт, скоры на `val` и OOF-скоры `avito-joint` |
+| Димон | `sequence` — `gru-din`, `sasrec` | Отчёт, скоры на `val` и OOF-скоры `gru-din` |
 
 На каждой машине из корня репозитория:
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements-gpu.txt
-$data = 'C:\study\AvitoData\competition'
-```
-
-**Участник 1** запускает CatBoost.
-
-```powershell
-.\.venv\Scripts\python.exe team_runs.py job --role gbdt --data $data --output .\runs\team-gbdt --gpu 0
-```
-
-**Участники 2 и 3** дополнительно устанавливают зависимости нейросетей. Ту же установку выполняет участник, который будет собирать ансамбль.
-
-```powershell
 .\.venv\Scripts\python.exe -m pip install -r requirements-experiments.txt
 .\.venv\Scripts\python.exe -m pip install "torch==2.10.0+cu126" --index-url https://download.pytorch.org/whl/cu126
+$data = 'C:\study\AvitoData\competition'
+$round = 'avito-families-v1'
 ```
 
-**Участник 2** запускает модели взаимодействия кандидатов внутри ленты.
+**Кирилл** запускает CatBoost.
 
 ```powershell
-.\.venv\Scripts\python.exe team_runs.py job --role listwise --data $data --output .\runs\team-listwise --gpu 0
+.\.venv\Scripts\python.exe team_runs.py job --role gbdt --data $data --output .\runs\team-gbdt --gpu 0 --report-round $round
 ```
 
-**Участник 3** запускает модели последовательности действий.
+**Савва** запускает модели взаимодействия кандидатов внутри ленты.
 
 ```powershell
-.\.venv\Scripts\python.exe team_runs.py job --role sequence --data $data --output .\runs\team-sequence --gpu 0
+.\.venv\Scripts\python.exe team_runs.py job --role listwise --data $data --output .\runs\team-listwise --gpu 0 --report-round $round
+```
+
+**Димон** запускает модели последовательности действий.
+
+```powershell
+.\.venv\Scripts\python.exe team_runs.py job --role sequence --data $data --output .\runs\team-sequence --gpu 0 --report-round $round
 ```
 
 Если запуск прервался после создания отчёта, повторите ту же команду с `--resume`.
@@ -101,20 +97,76 @@ $data = 'C:\study\AvitoData\competition'
 `team_runs.py merge` можно запустить на любой из трёх машин после получения результатов. С флагом `--stack` эта машина дополнительно обучит финальный CatBoost на двух OOF-скорах.
 
 ```powershell
-.\.venv\Scripts\python.exe team_runs.py merge --data $data --runs .\runs\team-gbdt .\runs\team-listwise .\runs\team-sequence --output .\runs\team-merged --gpu 0 --stack
+.\.venv\Scripts\python.exe team_runs.py merge --data $data --runs .\runs\team-gbdt .\runs\team-listwise .\runs\team-sequence --output .\runs\team-merged --gpu 0 --stack --report-round $round
 ```
 
 Сборка проверяет состав и порядок выбранных лент, бюджет обучения и пары `(feed_id, item_id)`, затем сравнивает Z-блендинг, RRF, штраф за повтор категории и стекинг на общей `val`.
 
+### Полный train по частям
+
+Команды используют все 3 151 208 лент `train` и всю `val`. Каждая из 21 части содержит около 150 000 лент. Чтение идёт напрямую из архива в распакованном виде, общие эмбеддинги остаются в исходном memmap. Каждая часть обучает свой экземпляр выбранной модели. Сборка усредняет Z-нормализованные внутри ленты скоры этих экземпляров на одинаковых кандидатах.
+
+| Кто | Части | Всего лент train |
+|---|---|---:|
+| Кирилл | 1, 4, 7, 10, 13, 16, 19 | 1 050 403 |
+| Савва | 2, 5, 8, 11, 14, 17, 20 | 1 050 403 |
+| Димон | 3, 6, 9, 12, 15, 18, 21 | 1 050 402 |
+
+После установки выше каждый выполняет свою команду. `--ui` открывает окно с текущей частью и оставляет его после обучения. `--predict-test` сразу сохраняет скоры для будущего сабмита.
+
+```powershell
+$data = 'C:\study\AvitoData\competition'
+$round = 'avito-full-v1'
+
+# Кирилл
+.\.venv\Scripts\python.exe sharded_runs.py train --data $data --output .\runs\avito-full --person kirill --predict-test --ui --report-round $round
+
+# Савва
+.\.venv\Scripts\python.exe sharded_runs.py train --data $data --output .\runs\avito-full --person savva --predict-test --ui --report-round $round
+
+# Димон
+.\.venv\Scripts\python.exe sharded_runs.py train --data $data --output .\runs\avito-full --person dimon --predict-test --ui --report-round $round
+```
+
+По умолчанию обучается `strong-gbdt`. Для сравнения нескольких моделей добавьте, например, `--models strong-gbdt avito-joint gru-din` ко всем командам. Чтобы распределить миллион лент, добавьте `--train-feeds 1000000 --shards 9` и укажите новую папку `--output` и новый раунд. Команда `sharded_runs.py plan --data $data --train-feeds 1000000 --shards 9` покажет назначения до запуска. При целых частях, не помещающихся в память, увеличьте `--shards` для всей команды и начните новую серию в новом каталоге.
+
+На RTX 4060 Laptop пилот `strong-gbdt` на 50 000 лент занял 3 мин 39 с при 120 деревьях. На 200 000 лент подготовка и короткий прогон из 20 деревьев заняли 11 мин 22 с с пиком около 14,5 ГиБ RAM. Оценка полного прогона `strong-gbdt` с предсказанием `test` — 4–6 часов на одном ПК или 1,5–2,5 часа на трёх похожих машинах. Для девяти основных моделей вместе оценка составляет 30–45 часов на одном ПК или 10–16 часов на трёх при трёх эпохах. Время передачи файлов зависит от сети. Для режима по частям используются отдельные веса, а OOF-стекинг выполняется в режиме сравнения семейств выше.
+
+Для девяти моделей добавьте к своей команде этот аргумент:
+
+```powershell
+--models history category-trend pixie-decays strong-gbdt avito-joint set-transformer neural-pairwise gru-din sasrec
+```
+
+Для полного прогона на одном ПК запустите ту же команду с `--person all`. Она обходит части по очереди и сама запускает сборку. Повтор команды продолжает тот же план и пропускает завершённые модели и части.
+
+```powershell
+.\.venv\Scripts\python.exe sharded_runs.py train --data $data --output .\runs\avito-full --person all --predict-test --ui --report-round $round
+```
+
+При запуске на трёх ПК передайте Кириллу каталоги `parts/part-NNN` с `part.json`, `fit/report.json` и файлами `fit/<модель>/val_predictions.parquet` и `test_predictions.parquet`. После сбора в одной папке Кирилл запускает:
+
+```powershell
+.\.venv\Scripts\python.exe sharded_runs.py merge --data $data --output .\runs\avito-full --predict-test --report-round $round
+```
+
+Сборка проверяет покрытие всех назначенных частей и соответствие кандидатов. Общие результаты будут в `merged/report.json`, файлы сабмита — в `merged/<модель>/submission.parquet` внутри папки запуска. Доля RAM и время рассчитываются на одну часть. Общая подготовка признаков для всех 3,15 млн лент одновременно потребовала бы около 31 ГиБ только для 34 столбцов, ещё до создания CatBoost Pool.
+
 ### Отчёты команды на GitHub
 
-Каждый участник заполняет свой файл и открывает отдельный PR в `main`.
+При общем `--report-round` завершённые отчёты публикуются в ветках `team-reports/<раунд>/<роль-или-часть>` и подтягиваются в `runs/team-reports/<раунд>/` при завершении каждого задания. Нужны авторизованный Git и право записи в репозиторий. Обновить отчёты вручную можно в любой момент.
 
-- Участник 1 — [форма GBDT](reports/gbdt.md)
-- Участник 2 — [форма listwise](reports/listwise.md)
-- Участник 3 — [форма последовательных моделей](reports/sequence.md)
+```powershell
+.\.venv\Scripts\python.exe team_reports.py pull --round $round
+```
 
-Числа берите из таблицы `models` в `report.json`. Для полной NDCG используйте поля `tuning.ndcg`, `holdout.ndcg` и `val.ndcg`. Время и пик RAM указаны в `seconds` и `peak_ram_mib`. Если модель завершилась с ошибкой, запишите этап и сообщение вместо метрики. Участники 2 и 3 также отмечают наличие OOF-файла и число лент с OOF-скорами. В GitHub добавляйте заполненную форму, а файлы со скорами передавайте сборщику внутри команды.
+Для ручных комментариев и рекомендаций сохранены отдельные формы, которые можно отправить через PR в `main`.
+
+- Кирилл — [форма GBDT](reports/gbdt.md)
+- Савва — [форма listwise](reports/listwise.md)
+- Димон — [форма последовательных моделей](reports/sequence.md)
+
+Числа берите из `report.json`. Лимиты и фактические размеры указаны в `train_feed_limit` / `val_feed_limit` и `train_feeds` / `val_feeds`. Для полной NDCG используйте поля `tuning.ndcg`, `holdout.ndcg` и `val.ndcg` из `models`. Время и пик RAM указаны в `seconds` и `peak_ram_mib`. Если модель завершилась с ошибкой, запишите этап и сообщение вместо метрики. Савва и Димон также отмечают наличие OOF-файла и число лент с OOF-скорами. GitHub хранит текстовые сводки. Файлы со скорами и веса передавайте внутри команды.
 
 ## Окно обучения на GPU
 

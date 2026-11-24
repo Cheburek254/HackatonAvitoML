@@ -51,6 +51,7 @@ class Dashboard:
         self.watch_stamp = None
         self.watch_log = None
         self.watch_status = None
+        self.watch_label = ""
         self.watch_offset = 0
         self.watch_active = False
         self.result_rows = {}
@@ -62,6 +63,7 @@ class Dashboard:
         self.train_feeds, self.val_feeds = tk.StringVar(value="0"), tk.StringVar(value="0")
         self.selection = {name: tk.BooleanVar(value=True) for name in GPU_ABLATION}
         self.status = tk.StringVar(value="Готово к запуску")
+        self.sample = tk.StringVar()
         self.stage = tk.StringVar(value="")
         self.progress = tk.DoubleVar()
         self.model_progress = tk.DoubleVar()
@@ -139,6 +141,7 @@ class Dashboard:
         self.stop.pack(side="left", padx=(6, 0))
 
         self.label(right, variable=self.status, size=13, strong=True).pack(fill="x")
+        self.label(right, variable=self.sample, color=MUTED).pack(fill="x")
         ttk.Progressbar(right, variable=self.progress, maximum=100).pack(fill="x", pady=(5, 8))
         self.label(right, variable=self.stage, color=MUTED).pack(fill="x")
         ttk.Progressbar(right, variable=self.model_progress, maximum=100).pack(fill="x", pady=(3, 9))
@@ -213,6 +216,7 @@ class Dashboard:
         self.start.configure(state="disabled")
         self.stop.configure(state="normal")
         self.status.set("Запуск CUDA")
+        self.sample.set("")
         self.stage.set("")
         self.draw_curve()
         self.clear_log()
@@ -305,6 +309,7 @@ class Dashboard:
                 job = json.loads(self.watch_config.read_text(encoding="utf-8"))
                 self.report_path, self.report_stamp = Path(job["report"]), None
                 self.watch_log, self.watch_status = Path(job["log"]), Path(job["status"])
+                self.watch_label = job.get("label", "")
                 self.data.set(job["data"])
                 self.models, self.completed, self.curve = job["models"], set(), []
                 self.budget = job["iterations"], job["epochs"]
@@ -313,6 +318,7 @@ class Dashboard:
                 self.progress.set(0)
                 self.model_progress.set(0)
                 self.status.set("Ожидание запуска")
+                self.sample.set(self.watch_label)
                 self.stage.set("")
                 self.clear_log()
                 self.table.delete(*self.table.get_children())
@@ -414,6 +420,15 @@ class Dashboard:
         self.log.configure(state="disabled")
 
     def render_report(self, report):
+        sizes = [self.watch_label] if self.watch_label else []
+        for split in ("train", "val"):
+            count = report.get(f"{split}_feeds")
+            limit = report.get(f"{split}_feed_limit")
+            if count is not None:
+                sizes.append(f"{split} · {count:,}".replace(",", " "))
+            elif limit is not None:
+                sizes.append(f"{split} · лимит {limit:,}".replace(",", " ") if limit else f"{split} · все")
+        self.sample.set("   |   ".join(sizes))
         self.table.delete(*self.table.get_children())
         rows = report["models"]
         self.result_rows = {row["model"]: row for row in rows}
@@ -444,8 +459,9 @@ class Dashboard:
     def load_report(self, path):
         try:
             report = json.loads(path.read_text(encoding="utf-8"))
+            self.watch_label = ""
             self.render_report(report)
-            self.status.set(f"Отчёт · {report['val_feeds']} лент")
+            self.status.set("Отчёт")
             stamp = path.stat().st_mtime_ns
         except (OSError, ValueError, KeyError) as error:
             messagebox.showerror("Отчёт не прочитан", str(error), parent=self.root)

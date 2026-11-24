@@ -55,17 +55,22 @@ def cuda_tensor():
     return Tensor
 
 
-def category_coefficients(inputs, targets):
+def category_coefficients(inputs, targets, indices):
     if has_torch_cuda() and not cuda_tensor.cache_info().currsize:
         import torch
 
         design = torch.as_tensor(inputs, device="cuda")
         target = torch.as_tensor(targets, device="cuda")
-        weights = design.new_zeros(inputs.shape[1])
+        codes = torch.as_tensor(indices.astype(np.int64), device="cuda")
+        width = inputs.shape[1]
+        weights = design.new_zeros(width + 256)
         for _ in range(80):
-            residual = (design @ weights).sigmoid() - target
-            weights -= .6 * ((design.T @ residual) / len(targets) + .002 * weights)
+            residual = (design @ weights[:width] + weights[width:][codes]).sigmoid() - target
+            by_category = torch.bincount(codes, weights=residual, minlength=256)
+            gradient = torch.cat([design.T @ residual, by_category]) / len(targets)
+            weights -= .6 * (gradient + .002 * weights)
         return weights.cpu().numpy()
+    inputs = np.column_stack([inputs, np.eye(256, dtype=np.float32)[indices]])
     tensor = cuda_tensor()
     design = tensor(inputs, device="CUDA").realize()
     target = tensor(targets, device="CUDA").realize()

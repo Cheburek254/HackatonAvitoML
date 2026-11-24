@@ -25,17 +25,25 @@ TEACHERS = {"listwise": "avito-joint", "sequence": "gru-din"}
 SCRIPTS = Path(__file__).resolve().parent
 
 
-def run(script, *args):
-    subprocess.run([sys.executable, "-u", "-X", "utf8", str(SCRIPTS / script), *map(str, args)], check=True)
+def run(script, *args, log=None):
+    command = [sys.executable, "-u", "-X", "utf8", str(SCRIPTS / script), *map(str, args)]
+    if log is None:
+        subprocess.run(command, check=True)
+    else:
+        with log.open("w", encoding="utf-8") as file:
+            subprocess.run(command, stdout=file, stderr=subprocess.STDOUT, check=True)
 
 
-def sample_signature(data, train_feeds, val_feeds):
+def sample_signature(data, train_feeds, val_feeds, *, train_offset=0, validation_sample=None):
     result = {}
     columns = ("feed_id", "timestamp")
     for name, limit in (("train", train_feeds), ("val", val_feeds)):
+        if name == "val" and validation_sample is not None:
+            result[name] = validation_sample
+            continue
         hashes = {column: hashlib.sha256() for column in columns}
         rows = 0
-        for batch in feed_batches(data / name, columns, limit):
+        for batch in feed_batches(data / name, columns, limit, offset=train_offset if name == "train" else 0):
             rows += batch.height
             for column in columns:
                 hashes[column].update(np.asarray(batch[column].to_numpy(), dtype="<i8").tobytes())
@@ -95,6 +103,10 @@ def job(args):
         metadata["oof"] = True
     metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
     print(f"Team job ready: {args.output}", flush=True)
+    if args.report_round:
+        from team_reports import sync
+
+        sync(args.report_round, args.role, report, extra={"Роль": args.role, "OOF": "Да" if metadata["oof"] else "—"})
 
 
 def merge(args):
@@ -125,7 +137,7 @@ def merge(args):
         for name in JOBS[role]:
             path = directory / name / "val_predictions.parquet"
             scores = score_summary(attach_scores(labels, pl.read_parquet(path)), cutoff, gpu_ndcg)
-            rows.append({"model": name, **scores})
+            rows.append({"model": name, "train_feeds": signature["train"]["rows"], **scores})
             files[name] = path
     from ensemble import fit_families
 
@@ -141,12 +153,20 @@ def merge(args):
             run("ranker.py", "train", *benchmark_args(args, settings), "--variant", name, "--output", directory,
                 "--device", "gpu", "--tune-before", cutoff, "--stack-train", *sources, "--stack-val", *validation_scores)
             predictions = pl.read_parquet(directory / "val_predictions.parquet")
-            rows.append({"model": name, **score_summary(attach_scores(labels, predictions), cutoff, gpu_ndcg)})
-    report = {"complete": True, "val_feeds": signature["val"]["rows"], "settings": settings, "sample": signature,
+            stats = json.loads((directory / "metrics.json").read_text(encoding="utf-8"))
+            rows.append({"model": name, "train_feeds": stats["train_feeds"],
+                         **score_summary(attach_scores(labels, predictions), cutoff, gpu_ndcg)})
+    report = {"complete": True, "train_feeds": signature["train"]["rows"], "val_feeds": signature["val"]["rows"],
+              "train_feed_limit": settings["train_feeds"], "val_feed_limit": settings["val_feeds"],
+              "settings": settings, "sample": signature,
               "tuning_cutoff_timestamp": cutoff, "models": sorted(rows, key=lambda item: item["holdout"]["ndcg"], reverse=True)}
     (args.output / "report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     for row in report["models"]:
         print(f"{row['model']:<22} {row['holdout']['ndcg']:.6f}  {row['val']['ndcg']:.6f}")
+    if args.report_round:
+        from team_reports import sync
+
+        sync(args.report_round, "ensemble", args.output / "report.json")
 
 
 def main():
@@ -158,11 +178,14 @@ def main():
         command.add_argument("--output", type=Path, required=True)
         command.add_argument("--gpu", default="0")
         command.add_argument("--threads", type=int, default=6)
+        command.add_argument("--report-round", help="Publish and collect reports in this GitHub round")
     worker.add_argument("--role", choices=JOBS, required=True)
-    worker.add_argument("--train-feeds", type=int, default=50_000)
-    worker.add_argument("--val-feeds", type=int, default=0)
+    worker.add_argument("--train-feeds", type=int, default=200_000,
+                        help="Use the first N training feeds, or 0 for all (default: %(default)s)")
+    worker.add_argument("--val-feeds", type=int, default=0,
+                        help="Use the first N validation feeds, or 0 for all (default: %(default)s)")
     worker.add_argument("--iterations", type=int, default=120)
-    worker.add_argument("--epochs", type=int, default=3)
+    worker.add_argument("--epochs", type=int, default=12)
     worker.add_argument("--history-window", type=int, default=32)
     worker.add_argument("--batch-size", type=int, default=16)
     worker.add_argument("--skip-oof", action="store_true")
@@ -173,6 +196,12 @@ def main():
     collect.add_argument("--optuna-trials", type=int, default=48)
     collect.set_defaults(action=merge)
     args = parser.parse_args()
+    if min(getattr(args, "train_feeds", 0), getattr(args, "val_feeds", 0)) < 0:
+        worker.error("feed limits must be nonnegative (0 uses all feeds)")
+    if args.report_round:
+        from team_reports import valid_name
+
+        valid_name(args.report_round)
     args.action(args)
 
 

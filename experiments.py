@@ -122,6 +122,8 @@ def run_model(args, name, output, tune_ids, cutoff, extra=()):
     else:
         command.extend(["--epochs", str(args.epochs), "--batch-size", str(args.batch_size),
                         "--device", args.neural_device, "--history-window", str(args.history_window)])
+    if args.train_offset:
+        command.extend(["--train-offset", str(args.train_offset)])
     subprocess.run([*command, *extra], check=True)
     return pl.read_parquet(output / "val_predictions.parquet")
 
@@ -194,7 +196,8 @@ def import_results(args, report, labels, results, files):
         previous = json.loads((directory / "report.json").read_text(encoding="utf-8"))
         fields = ("val_feeds", "val_candidates", "tuning_cutoff_timestamp", "train_feed_limit", "iterations", "gpu")
         if (Path(previous["data"]).resolve() != args.data.resolve() or not previous["complete"]
-                or any(previous.get(field) != report[field] for field in fields)):
+                or any(previous.get(field) != report[field] for field in fields)
+                or previous.get("train_offset", 0) != report["train_offset"]):
             raise ValueError(f"Incompatible source for reusing trained models: {directory}")
         for row in previous["models"]:
             name = row["model"]
@@ -223,7 +226,8 @@ def fit_stack_models(args, tune_ids, cutoff, files):
             script = Path(__file__).with_name("neural.py")
             subprocess.run([
                 sys.executable, "-u", "-X", "utf8", str(script), "oof", "--variant", teacher, "--data", str(args.data),
-                "--output", str(path), "--train-feeds", str(args.train_feeds), "--batch-size", str(args.batch_size),
+                "--output", str(path), "--train-feeds", str(args.train_feeds), "--train-offset", str(args.train_offset),
+                "--batch-size", str(args.batch_size),
                 "--epochs", str(args.epochs), "--threads", str(args.threads), "--device", args.neural_device,
                 "--history-window", str(args.history_window),
             ], check=True)
@@ -265,8 +269,13 @@ def benchmark(args):
 
 def run_benchmark(args, labels, cutoff, tune_ids, metric, selected):
     results, files = [], {}
+    batches = feed_batches(args.data / "train", ["feed_id"], args.train_feeds, offset=args.train_offset)
+    train_feeds = sum(batch.height for batch in batches)
+    if not train_feeds:
+        raise ValueError("No training feeds in the requested range")
     report = {"data": str(args.data), "val_feeds": labels["feed_id"].n_unique(), "val_candidates": labels.height,
-              "tuning_cutoff_timestamp": cutoff, "train_feed_limit": args.train_feeds,
+              "tuning_cutoff_timestamp": cutoff, "train_feeds": train_feeds,
+              "train_feed_limit": args.train_feeds, "val_feed_limit": args.val_feeds, "train_offset": args.train_offset,
               "iterations": args.iterations, "epochs": args.epochs, "requested_models": args.models,
               "gpu": vars(selected) if selected else None, "complete": False}
     options = {"by_category": args.by_category, "history_window": args.history_window, "threads": args.threads,
@@ -278,6 +287,10 @@ def run_benchmark(args, labels, cutoff, tune_ids, metric, selected):
     report_path = args.output / "report.json"
     if args.resume:
         previous = json.loads(report_path.read_text(encoding="utf-8"))
+        # Older reports recorded the train limit and actual val count only.
+        previous.setdefault("train_feeds", train_feeds)
+        previous.setdefault("val_feed_limit", args.val_feeds)
+        previous.setdefault("train_offset", 0)
         if (any(previous.get(key) != value for key, value in report.items())
                 or previous.get("options", options) != options):
             raise ValueError("Resume requires an incomplete report and the same data, model list, GPU and budgets")
@@ -304,7 +317,9 @@ def run_benchmark(args, labels, cutoff, tune_ids, metric, selected):
         metrics_path = output / "metrics.json"
         stats = json.loads(metrics_path.read_text(encoding="utf-8")) if metrics_path.is_file() else {}
         results.append({"model": name, **scores, "seconds": round(perf_counter() - start, 2),
-                        **{key: stats[key] for key in ("peak_ram_mib", "tuning_curve", "epoch_seconds") if key in stats}})
+                        **{key: stats[key] for key in ("train_feeds", "peak_ram_mib", "peak_private_mib",
+                                                      "tuning_curve", "epoch_seconds")
+                           if key in stats}})
         files[name] = output / "val_predictions.parquet"
         save_report(report_path, report, results)
         print(f"Finished {name}: holdout_ndcg={scores['holdout']['ndcg']:.8f}", flush=True)
@@ -371,6 +386,7 @@ def main():
     run.add_argument("--iterations", type=int, default=500)
     run.add_argument("--epochs", type=int, default=5)
     run.add_argument("--batch-size", type=int, default=16)
+    run.add_argument("--train-offset", type=int, default=0, help="Skip the first N training feeds")
     run.add_argument("--dual-batch-size", type=int, default=4096)
     run.add_argument("--threads", type=int, default=4)
     run.add_argument("--history-window", type=int, default=32)
@@ -399,11 +415,13 @@ def main():
     for command in (run, diagnostic, ensemble):
         command.add_argument("--data", type=Path, required=True)
     args = parser.parse_args()
-    if min(getattr(args, "train_feeds", 0), getattr(args, "val_feeds", 0)) < 0:
-        parser.error("Feed limits must be nonnegative")
+    if min(getattr(args, name, 0) for name in ("train_feeds", "val_feeds", "train_offset")) < 0:
+        parser.error("Feed limits and offset must be nonnegative")
     if args.action == benchmark:
         args.models = args.models or (list(GPU_ABLATION) if args.gpu is not None else
                                       [*OFFICIAL, *TREE_MODELS, *NEURAL] if args.baseline_zip else list(TREE_MODELS))
+        if args.train_offset and set(args.models).intersection((*OFFICIAL, *CUDA_NEURAL)):
+            parser.error("Training offsets are unavailable for the official baselines and dual-history")
         if args.gpu is not None:
             if "lambda" in args.models or "als" in args.models:
                 parser.error("This GPU benchmark excludes CPU-only lambda and als")

@@ -180,7 +180,7 @@ def expand_batch(feeds, embeddings, labeled, features, reference, clusters=None)
     )
 
 
-def feed_batches(split, columns, max_feeds=0):
+def feed_batches(split, columns, max_feeds=0, *, offset=0):
     parts = sorted((split / "impressions").glob("part-*.parquet"))
     if not parts:
         raise FileNotFoundError(f"No part-*.parquet files under {split / 'impressions'}")
@@ -188,7 +188,16 @@ def feed_batches(split, columns, max_feeds=0):
     processed = 0
     for part in parts:
         with pq.ParquetFile(part) as parquet:
+            if offset and offset >= parquet.metadata.num_rows:
+                offset -= parquet.metadata.num_rows
+                continue
             for batch in parquet.iter_batches(batch_size=512, columns=columns):
+                if offset >= batch.num_rows:
+                    offset -= batch.num_rows
+                    continue
+                if offset:
+                    batch = batch.slice(offset)
+                    offset = 0
                 if max_feeds:
                     batch = batch.slice(0, max_feeds - processed)
                 yield pl.from_arrow(batch)
@@ -205,7 +214,7 @@ def open_embeddings(split):
 
 
 def candidate_batches(split, *, features=FEATURES, labeled=False, max_feeds=0,
-                      reference=None, after=None, before=None, centers=None, device="cpu"):
+                      reference=None, after=None, before=None, centers=None, device="cpu", offset=0):
     columns = ["feed_id", "user_embedding", *CANDIDATE_COLUMNS]
     if "history_length" in features:
         columns.extend(HISTORY_COLUMNS)
@@ -220,12 +229,12 @@ def candidate_batches(split, *, features=FEATURES, labeled=False, max_feeds=0,
     if centers is not None:
         candidate_key = "item_id__embedding_idx"
         history_key = "history__item_id__embedding_idx"
-        batches = feed_batches(split, [candidate_key, history_key], max_feeds)
+        batches = feed_batches(split, [candidate_key, history_key], max_feeds, offset=offset)
         indices = np.unique(np.concatenate([
             batch[key].explode().unique().to_numpy() for batch in batches for key in (candidate_key, history_key)
         ]))
         clusters = embedding_clusters.assign(embeddings, centers, device, indices[indices >= 0].astype(np.intp))
-    for batch in feed_batches(split, columns, max_feeds):
+    for batch in feed_batches(split, columns, max_feeds, offset=offset):
         if after is not None:
             batch = batch.filter(pl.col("timestamp") >= after)
         if before is not None:
@@ -249,21 +258,23 @@ def make_pool(candidates, features, threads, labeled=False):
 def load_training(args, features, centers=None):
     split = args.data / "train"
     kind = behavior.reference_kind(features)
+    selection = {"max_feeds": args.train_feeds, "offset": args.train_offset}
     if kind is None:
-        return read_candidates(split, features=features, labeled=True, max_feeds=args.train_feeds,
-                               centers=centers, device=args.device), None
+        return read_candidates(split, features=features, labeled=True, centers=centers,
+                               device=args.device, **selection), None
 
     columns = ["timestamp", "user_id", "item_id", "category_id", "target", *HISTORY_COLUMNS[:2]]
-    past = pl.concat(list(feed_batches(split, columns, args.train_feeds)))
-    if not past.height:
+    feeds = list(feed_batches(split, columns, **selection))
+    if not feeds:
         raise ValueError("No training feeds")
+    past = pl.concat(feeds)
     times = np.sort(past["timestamp"].to_numpy())
     boundaries = sorted(set(int(times[len(times) * index // 4]) for index in (1, 2, 3)) - {int(times[0])})
     reference = behavior.Reference(kind)
     chunks = []
     for after, before in zip([None, *boundaries], [*boundaries, None], strict=True):
-        chunks.append(read_candidates(split, features=features, labeled=True, max_feeds=args.train_feeds,
-                                      reference=reference, after=after, before=before))
+        chunks.append(read_candidates(split, features=features, labeled=True, reference=reference,
+                                      after=after, before=before, **selection))
         if before is not None:
             reference = behavior.fit(kind, past.filter(pl.col("timestamp") < before), args.threads, args.device)
     return pl.concat(chunks, rechunk=True), behavior.fit(kind, past, args.threads, args.device)
@@ -272,7 +283,8 @@ def load_training(args, features, centers=None):
 def train_centers(args):
     split = args.data / "train"
     indices = "item_id__embedding_idx"
-    used = pl.concat(list(feed_batches(split, [indices], args.train_feeds)))[indices].explode().unique().sort().to_numpy()
+    batches = feed_batches(split, [indices], args.train_feeds, offset=args.train_offset)
+    used = pl.concat(list(batches))[indices].explode().unique().sort().to_numpy()
     return embedding_clusters.fit(open_embeddings(split), used[used >= 0], args.device)
 
 
@@ -314,8 +326,9 @@ def select_gpu_checkpoint(model, tuning, val_pool, args):
 def distillation_targets(args, training):
     features = VARIANTS["category-trend"]
     split = args.data / "train"
-    teacher_data = read_candidates(split, features=features, labeled=True, max_feeds=args.train_feeds)
-    times = pl.concat(list(feed_batches(split, ["feed_id", "timestamp"], args.train_feeds)))
+    teacher_data = read_candidates(split, features=features, labeled=True, max_feeds=args.train_feeds,
+                                   offset=args.train_offset)
+    times = pl.concat(list(feed_batches(split, ["feed_id", "timestamp"], args.train_feeds, offset=args.train_offset)))
     stamps = times["timestamp"].unique().sort().to_numpy()
     cuts = np.unique([stamps[len(stamps) * index // 4] for index in (1, 2, 3)])
     soft_scores = []
@@ -361,6 +374,7 @@ def train(args):
         training = distillation_targets(args, training)
     if args.variant in STACK_VARIANTS:
         training = with_stack_scores(training, args.stack_train, train=True)
+    train_feeds = training["feed_id"].n_unique()
     train_pool = make_pool(training, features, args.threads, labeled=True)
     del training
     val = read_candidates(args.data / "val", features=features, labeled=True, max_feeds=args.val_feeds,
@@ -390,9 +404,12 @@ def train(args):
     report = {
         **{f"val_{name}": value for name, value in metrics.items()},
         "trees": model.tree_count_,
+        "train_feeds": train_feeds,
+        "val_feeds": val["feed_id"].n_unique(),
         "train_candidates": train_pool.num_row(),
         "val_candidates": val.height,
         "train_feed_limit": args.train_feeds,
+        "train_offset": args.train_offset,
         "val_feed_limit": args.val_feeds,
         "device": args.device,
         "variant": args.variant,
@@ -407,6 +424,7 @@ def train(args):
     if centers is not None:
         np.save(args.output / "centers.npy", centers)
     report["peak_ram_mib"] = peak_ram_mib()
+    report["peak_private_mib"] = peak_ram_mib(private=True)
     (args.output / "metrics.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(json.dumps({key: value for key, value in report.items() if key != "tuning_curve"}, indent=2))
 
@@ -447,6 +465,7 @@ def main():
     commands = parser.add_subparsers(required=True)
     training = commands.add_parser("train")
     training.add_argument("--train-feeds", type=int, default=50_000, help="0 uses the full train split")
+    training.add_argument("--train-offset", type=int, default=0, help="Skip the first N training feeds")
     training.add_argument("--val-feeds", type=int, default=10_000, help="0 uses the full val split")
     training.add_argument("--iterations", type=int, default=500)
     training.add_argument("--variant", choices=VARIANTS, default="history")
@@ -466,8 +485,8 @@ def main():
         command.add_argument("--gpu-id", help="NVIDIA index or UUID from nvidia-smi")
 
     args = parser.parse_args()
-    if getattr(args, "train_feeds", 0) < 0 or getattr(args, "val_feeds", 0) < 0:
-        parser.error("Feed limits must be nonnegative")
+    if min(getattr(args, name, 0) for name in ("train_feeds", "val_feeds", "train_offset")) < 0:
+        parser.error("Feed limits and offset must be nonnegative")
     if args.threads < 1 or getattr(args, "iterations", 1) < 1:
         parser.error("Threads and iterations must be positive")
     if getattr(args, "variant", None) == "lambda" and args.device != "cpu":

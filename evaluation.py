@@ -15,7 +15,7 @@ def zscore(column):
     return ((values - values.mean().over("feed_id")) / (deviation + 1e-6)).cast(pl.Float32)
 
 
-def peak_ram_mib():
+def peak_ram_mib(*, private=False):
     if sys.platform == "win32":
         import ctypes
         from ctypes import wintypes
@@ -36,7 +36,9 @@ def peak_ram_mib():
         query.argtypes = (wintypes.HANDLE, ctypes.POINTER(MemoryCounters), wintypes.DWORD)
         if not query(current(), ctypes.byref(counters), counters.size):
             return None
-        return round(counters.peak / 2**20, 1)
+        return round((counters.peak_pagefile if private else counters.peak) / 2**20, 1)
+    if private:
+        return None
     import resource
 
     value = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss

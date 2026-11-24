@@ -4,6 +4,7 @@ import argparse
 import json
 from pathlib import Path
 from time import perf_counter
+from uuid import uuid4
 
 import numpy as np
 import polars as pl
@@ -26,13 +27,13 @@ def id_tensor(values):
 
 
 class Feeds(Dataset):
-    def __init__(self, split, max_feeds, labeled, window, uses_history):
+    def __init__(self, split, max_feeds, labeled, window, uses_history, *, offset=0):
         columns = ["feed_id", "timestamp", "user_embedding", *CANDIDATE_COLUMNS]
         if labeled:
             columns.append("target")
         if uses_history:
             columns.extend([*HISTORY_COLUMNS, "history__event_type", "history__event_source"])
-        self.feeds = pl.concat(list(feed_batches(split, columns, max_feeds)))
+        self.feeds = pl.concat(list(feed_batches(split, columns, max_feeds, offset=offset)))
         self.embeddings = open_embeddings(split)
         self.labeled = labeled
         self.window = window if uses_history else 0
@@ -220,7 +221,8 @@ def train(args):
         raise FileExistsError(args.output)
     torch.manual_seed(42)
     use_history = args.variant in HISTORY_VARIANTS
-    train_set = Feeds(args.data / "train", args.train_feeds, True, args.history_window, use_history)
+    train_set = Feeds(args.data / "train", args.train_feeds, True, args.history_window, use_history,
+                      offset=args.train_offset)
     val_set = Feeds(args.data / "val", args.val_feeds, True, args.history_window, use_history)
     train_batches = loader(train_set, args.batch_size, shuffle=True)
     val_labels = labels(val_set)
@@ -258,6 +260,7 @@ def train(args):
     predictions = scores(model, loader(val_set, args.batch_size), args.device)
     report = {f"val_{name}": value for name, value in ndcg(attach_scores(val_labels, predictions)).items()}
     report.update(variant=args.variant, best_epoch=best_epoch, tune_before=args.tune_before, tuning_curve=curve,
+                  train_feeds=len(train_set), val_feeds=len(val_set),
                   epoch_seconds=epoch_seconds, peak_ram_mib=peak_ram_mib())
     args.output.mkdir(parents=True)
     torch.save({"state_dict": best_state, "variant": args.variant, "history_window": args.history_window}, args.output / "model.pt")
@@ -268,7 +271,8 @@ def train(args):
 def oof(args):
     if args.output.exists():
         raise FileExistsError(args.output)
-    dataset = Feeds(args.data / "train", args.train_feeds, True, args.history_window, args.variant in HISTORY_VARIANTS)
+    dataset = Feeds(args.data / "train", args.train_feeds, True, args.history_window, args.variant in HISTORY_VARIANTS,
+                    offset=args.train_offset)
     timestamps = dataset.feeds["timestamp"].to_numpy()
     unique = np.unique(timestamps)
     if len(unique) < 3:
@@ -288,7 +292,12 @@ def oof(args):
         predictions = loader(Subset(dataset, score_rows.tolist()), args.batch_size)
         chunks.append(scores(model, predictions, args.device))
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    pl.concat(chunks).write_parquet(args.output)
+    pending = args.output.with_name(f".oof-{uuid4().hex}.parquet")
+    try:
+        pl.concat(chunks).write_parquet(pending)
+        pending.replace(args.output)
+    finally:
+        pending.unlink(missing_ok=True)
 
 
 def predict(args):
@@ -312,6 +321,7 @@ def main():
     training.add_argument("--variant", choices=VARIANTS, default="neural-din")
     training.add_argument("--epochs", type=int, default=5)
     training.add_argument("--train-feeds", type=int, default=50_000)
+    training.add_argument("--train-offset", type=int, default=0)
     training.add_argument("--val-feeds", type=int, default=0)
     training.add_argument("--history-window", type=int, default=32)
     training.add_argument("--tune-before", type=int)
@@ -320,6 +330,7 @@ def main():
     oof_command.add_argument("--variant", choices=VARIANTS, required=True)
     oof_command.add_argument("--epochs", type=int, default=2)
     oof_command.add_argument("--train-feeds", type=int, default=50_000)
+    oof_command.add_argument("--train-offset", type=int, default=0)
     oof_command.add_argument("--history-window", type=int, default=32)
     oof_command.set_defaults(run=oof)
     prediction = commands.add_parser("predict")
@@ -334,8 +345,9 @@ def main():
     args = parser.parse_args()
     if min(args.batch_size, args.threads, getattr(args, "epochs", 1)) < 1:
         parser.error("Batch size, threads and epochs must be positive")
-    if not 1 <= getattr(args, "history_window", 1) <= 256 or min(getattr(args, "train_feeds", 0), getattr(args, "val_feeds", 0)) < 0:
-        parser.error("History window must be 1–256 and feed limits must be nonnegative")
+    if (not 1 <= getattr(args, "history_window", 1) <= 256
+            or min(getattr(args, name, 0) for name in ("train_feeds", "val_feeds", "train_offset")) < 0):
+        parser.error("History window must be 1–256 and feed limits and offset must be nonnegative")
     torch.set_num_threads(args.threads)
     if args.device == "cuda":
         if not torch.cuda.is_available():

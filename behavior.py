@@ -24,7 +24,6 @@ COMBINED_REFERENCES = ("covis-pixie", "popularity-trend", "category-model")
 FEATURES["strong-gbdt"] = [f"strong_{name}" for kind in COMBINED_REFERENCES for name in FEATURES[kind]]
 HISTORY_WINDOW = 8
 PIXIE_FRONTIER = 256
-CATEGORY_ONE_HOT = np.eye(256, dtype=np.float32)
 
 
 def reference_kind(features):
@@ -70,8 +69,7 @@ def category_inputs(categories, history):
     earlier_share = (categories[:, None] == earlier).sum(axis=1) / max(len(earlier), 1)
     membership = (categories[:, None] == known[known != 0]).sum(axis=1)
     return np.column_stack([np.ones(len(categories)), recent_share, earlier_share,
-                            np.log1p(membership), categories != 0,
-                            CATEGORY_ONE_HOT[categories.astype(np.uint8)]]).astype(np.float32)
+                            np.log1p(membership), categories != 0]).astype(np.float32)
 
 
 def percentiles(values):
@@ -79,23 +77,29 @@ def percentiles(values):
 
 
 def fit_category_model(feeds, device):
-    inputs, targets = [], []
+    inputs, targets, category_codes = [], [], []
     for categories, history, items in feeds.select("category_id", "history__category_id", "target").iter_rows():
         unique, inverse = np.unique(categories, return_inverse=True)
         positive = np.zeros(len(unique), dtype=np.float32)
         np.maximum.at(positive, inverse, items)
         inputs.append(category_inputs(unique, history))
         targets.append(positive)
+        category_codes.append(unique.astype(np.uint8))
     design = np.concatenate(inputs)
     target = np.concatenate(targets)
+    indices = np.concatenate(category_codes)
     if device == "gpu":
         from accelerator import category_coefficients
 
-        return category_coefficients(design, target)
-    weights = np.zeros(design.shape[1], dtype=np.float32)
+        return category_coefficients(design, target, indices)
+    width = design.shape[1]
+    weights = np.zeros(width + 256, dtype=np.float32)
     for _ in range(80):
-        probability = 1 / (1 + np.exp(-(design @ weights)))
-        weights -= .6 * (design.T @ (probability - target) / len(target) + .002 * weights)
+        logits = design @ weights[:width] + weights[width:][indices]
+        residual = 1 / (1 + np.exp(-logits)) - target
+        by_category = np.bincount(indices, weights=residual, minlength=256).astype(np.float32)
+        gradient = np.concatenate([design.T @ residual, by_category]) / len(target)
+        weights -= .6 * (gradient + .002 * weights)
     return weights
 
 
@@ -274,7 +278,10 @@ class Reference:
             return np.concatenate([self.covis(feed), self.graph.score(feed)])
         if self.kind == "category-model":
             categories, inverse = np.unique(feed["category_id"], return_inverse=True)
-            logits = category_inputs(categories, feed["history__category_id"]) @ self.arrays["coefficients"]
+            design = category_inputs(categories, feed["history__category_id"])
+            width = design.shape[1]
+            weights = self.arrays["coefficients"]
+            logits = design @ weights[:width] + weights[width:][categories.astype(np.uint8)]
             return np.stack([logits[inverse], percentiles(logits)[inverse]])
         if self.kind == "popularity-trend":
             prior = float(self.arrays["prior"][0])
