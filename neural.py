@@ -18,16 +18,19 @@ from evaluation import KEYS, attach_scores, ndcg, peak_ram_mib
 from ranker import BASE_FEATURES, CANDIDATE_COLUMNS, HISTORY_COLUMNS, feed_batches, open_embeddings
 
 VARIANTS = ("transformer", "transformer-listmle", "avito-joint", "neural-din", "bst", "gru-din", "sasrec",
-            "set-transformer", "neural-pairwise")
-HISTORY_VARIANTS = {"avito-joint", "neural-din", "bst", "gru-din", "sasrec", "neural-pairwise"}
+            "set-transformer", "neural-pairwise", "neural-din-plus", "gru-din-plus")
+HISTORY_VARIANTS = {"avito-joint", "neural-din", "bst", "gru-din", "sasrec", "neural-pairwise",
+                    "neural-din-plus", "gru-din-plus"}
+RICH_VARIANTS = {"neural-din-plus", "gru-din-plus"}
 
 
 def id_tensor(values):
-    return torch.from_numpy(np.asarray(values, dtype=np.int8).astype(np.uint8).astype(np.int64))
+    cleaned = [0 if v is None else v for v in values]
+    return torch.from_numpy(np.asarray(cleaned, dtype=np.int8).astype(np.uint8).astype(np.int64))
 
 
 class Feeds(Dataset):
-    def __init__(self, split, max_feeds, labeled, window, uses_history, *, offset=0):
+    def __init__(self, split, max_feeds, labeled, window, uses_history, *, offset=0, rich_features=False):
         columns = ["feed_id", "timestamp", "user_embedding", *CANDIDATE_COLUMNS]
         if labeled:
             columns.append("target")
@@ -37,6 +40,7 @@ class Feeds(Dataset):
         self.embeddings = open_embeddings(split)
         self.labeled = labeled
         self.window = window if uses_history else 0
+        self.rich_features = rich_features
 
     def __len__(self):
         return self.feeds.height
@@ -52,8 +56,8 @@ class Feeds(Dataset):
         feed = self.feeds.row(index, named=True)
         items, missing = self.vectors(feed["item_id__embedding_idx"])
         floats = torch.tensor([feed[name] for name in BASE_FEATURES], dtype=torch.float32).T.nan_to_num()
-        candidates = torch.cat([floats, items, missing[:, None]], dim=-1)
         user = F.normalize(torch.tensor(feed["user_embedding"], dtype=torch.float32), dim=0)
+        cat_ids = id_tensor(feed["category_id"])
         if self.window:
             # Reverse only the available prefix so recurrent layers see chronological order.
             indices = feed["history__item_id__embedding_idx"][:self.window][::-1]
@@ -62,9 +66,51 @@ class Feeds(Dataset):
                                   ("history__category_id", "history__event_type", "history__event_source")], dim=-1)
             history_features = torch.cat([vectors, history_missing[:, None]], dim=-1)
         else:
+            vectors = torch.empty((0, 128))
             history_features, events = torch.empty((0, 129)), torch.empty((0, 3), dtype=torch.long)
+        if self.rich_features:
+            m = len(items)
+            pct = (floats.argsort(dim=0).argsort(dim=0).float() + 0.5) / max(m, 1)
+            u_cos = (items * user).sum(dim=-1, keepdim=True)
+            extra = torch.zeros((m, 13), dtype=torch.float32)
+            if len(vectors):
+                h = len(vectors)
+                age = torch.arange(h - 1, -1, -1, dtype=torch.float32)
+                sims = items @ vectors.T
+                extra[:, 0] = sims.max(dim=1).values
+                extra[:, 1] = sims.topk(min(3, h), dim=1).values.mean(dim=1)
+                extra[:, 2] = (sims * torch.exp2(-age / 16.0)).max(dim=1).values
+                ev_t = events[:, 1]
+                ev1 = ev_t == 1
+                ev_other = ev_t > 1
+                ev_strong = ev_t >= 4
+                if ev1.any():
+                    extra[:, 3] = sims[:, ev1].max(dim=1).values
+                if ev_other.any():
+                    extra[:, 4] = sims[:, ev_other].max(dim=1).values
+                if ev_strong.any():
+                    extra[:, 5] = sims[:, ev_strong].max(dim=1).values
+                cat_w = torch.exp2(-age / 8.0)
+                cat_m = ((cat_ids[:, None] == events[:, 0][None, :]) & (cat_ids[:, None] != 0)).float()
+                extra[:, 6] = (cat_m @ cat_w) / cat_w.sum().clamp_min(1.0)
+                recent_mask = age < 8
+                earlier_mask = age >= 8
+                recent_valid = recent_mask & (events[:, 0] != 0)
+                earlier_valid = earlier_mask & (events[:, 0] != 0)
+                recent_share = cat_m[:, recent_valid].sum(dim=1) / max(int(recent_valid.sum()), 1)
+                earlier_share = cat_m[:, earlier_valid].sum(dim=1) / max(int(earlier_valid.sum()), 1)
+                extra[:, 7] = recent_share
+                if recent_valid.any() and earlier_valid.any():
+                    extra[:, 8] = recent_share - earlier_share
+            extra[:, 9] = len(feed["history__item_id"]) / 256.0
+            extra[:, 10] = u_cos[:, 0] - u_cos[:, 0].mean()
+            extra[:, 11] = extra[:, 0] - extra[:, 0].mean()
+            extra[:, 12] = extra[:, 2] - extra[:, 2].mean()
+            candidates = torch.cat([floats, pct, u_cos, extra, items, missing[:, None]], dim=-1)
+        else:
+            candidates = torch.cat([floats, items, missing[:, None]], dim=-1)
         target = torch.tensor(feed["target"], dtype=torch.float32) if self.labeled else torch.zeros(len(items))
-        return feed["feed_id"], feed["item_id"], candidates, id_tensor(feed["category_id"]), user, history_features, events, target
+        return feed["feed_id"], feed["item_id"], candidates, cat_ids, user, history_features, events, target
 
 
 def collate(rows):
@@ -77,11 +123,21 @@ def collate(rows):
 
 
 class Ranker(nn.Module):
-    def __init__(self, variant, width=64):
+    def __init__(self, variant, width=None):
         super().__init__()
+        width = width or (128 if variant in RICH_VARIANTS else 64)
         self.variant = variant
         self.category = nn.Embedding(256, 8, padding_idx=0)
-        self.candidate = nn.Linear(142, width)
+        if variant in RICH_VARIANTS:
+            self.candidate = nn.Sequential(
+                nn.Linear(161, width),
+                nn.LayerNorm(width),
+                nn.GELU(),
+                nn.Dropout(0.1),
+                nn.Linear(width, width),
+            )
+        else:
+            self.candidate = nn.Linear(142, width)
         self.user = nn.Linear(128, width)
         self.output = nn.Linear(width, 1)
         if variant == "set-transformer":
@@ -90,7 +146,8 @@ class Ranker(nn.Module):
             self.recover = nn.MultiheadAttention(width, 4, batch_first=True)
             self.set_norm = nn.LayerNorm(width)
         else:
-            self.encoder = nn.TransformerEncoder(self.layer(width), 2, enable_nested_tensor=False)
+            layers = 3 if variant in RICH_VARIANTS else 2
+            self.encoder = nn.TransformerEncoder(self.layer(width), layers, enable_nested_tensor=False)
         if variant in HISTORY_VARIANTS:
             self.event_type = nn.Embedding(256, 8, padding_idx=0)
             self.event_source = nn.Embedding(256, 8, padding_idx=0)
@@ -103,7 +160,7 @@ class Ranker(nn.Module):
             self.history_norm = nn.LayerNorm(width)
         if variant in {"bst", "sasrec"}:
             self.history_encoder = nn.TransformerEncoder(self.layer(width), 1, enable_nested_tensor=False)
-        if variant == "gru-din":
+        if variant in {"gru-din", "gru-din-plus"}:
             self.history_encoder = nn.GRU(width, width, batch_first=True)
 
     @staticmethod
@@ -122,7 +179,7 @@ class Ranker(nn.Module):
 
     def condition_on_history(self, candidates, history, events, padding):
         tokens, mask, lengths = self.history_tokens(history, events, padding)
-        if self.variant == "gru-din":
+        if self.variant in {"gru-din", "gru-din-plus"}:
             tokens, _ = self.history_encoder(tokens)
         if self.variant in {"bst", "sasrec"}:
             causal = torch.ones((tokens.shape[1], tokens.shape[1]), dtype=torch.bool, device=tokens.device).triu(1) if self.variant == "sasrec" else None
@@ -166,7 +223,7 @@ def loss_for(variant, scores, target, padding):
         valid = ~padding.gather(1, order)
         remaining = torch.logcumsumexp(ordered.masked_fill(~valid, -torch.finfo(scores.dtype).max).flip(1), dim=1).flip(1)
         return ((remaining - ordered).masked_fill(~valid, 0).sum(dim=1) / valid.sum(dim=1)).mean()
-    if variant != "neural-pairwise":
+    if variant not in {"neural-pairwise", *RICH_VARIANTS}:
         loss = F.binary_cross_entropy_with_logits(scores, target, reduction="none").masked_fill(padding, 0)
         return (loss.sum(dim=1) / (~padding).sum(dim=1)).mean()
     ranks = scores.detach().masked_fill(padding, -torch.inf).argsort(dim=1, descending=True).argsort(dim=1)
@@ -200,7 +257,7 @@ def labels(dataset):
     return dataset.feeds.select(*KEYS, "target").explode("item_id", "target")
 
 
-def train_epoch(model, optimizer, batches, device, variant, epoch):
+def train_epoch(model, optimizer, batches, device, variant, epoch, scheduler=None):
     start = perf_counter()
     model.train()
     for step, (_, _, inputs, target) in enumerate(batches, start=1):
@@ -208,7 +265,11 @@ def train_epoch(model, optimizer, batches, device, variant, epoch):
         inputs = tuple(tensor.to(device) for tensor in inputs)
         loss = loss_for(variant, model(*inputs), target.to(device), inputs[3])
         loss.backward()
+        if variant in RICH_VARIANTS:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
         if step == 1 or step == len(batches) or step % 100 == 0:
             print(f"{variant} epoch={epoch} batch={step}/{len(batches)} loss={loss.detach().item():.6f}", flush=True)
     seconds = round(perf_counter() - start, 2)
@@ -221,9 +282,10 @@ def train(args):
         raise FileExistsError(args.output)
     torch.manual_seed(42)
     use_history = args.variant in HISTORY_VARIANTS
+    rich = args.variant in RICH_VARIANTS
     train_set = Feeds(args.data / "train", args.train_feeds, True, args.history_window, use_history,
-                      offset=args.train_offset)
-    val_set = Feeds(args.data / "val", args.val_feeds, True, args.history_window, use_history)
+                      offset=args.train_offset, rich_features=rich)
+    val_set = Feeds(args.data / "val", args.val_feeds, True, args.history_window, use_history, rich_features=rich)
     train_batches = loader(train_set, args.batch_size, shuffle=True)
     val_labels = labels(val_set)
     tune_labels, tune_batches = val_labels, loader(val_set, args.batch_size)
@@ -235,6 +297,8 @@ def train(args):
         tune_batches = loader(Subset(val_set, indices.tolist()), args.batch_size)
     model = Ranker(args.variant).to(args.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.0001)
+    scheduler = (torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, len(train_batches) * args.epochs), eta_min=1e-5)
+                 if rich else None)
     best, best_epoch, best_state, curve = -1, 0, None, []
     epoch_seconds = []
     tuning_slates = None
@@ -243,7 +307,7 @@ def train(args):
 
         tuning_slates = Slates(tune_labels, args.device)
     for epoch in range(1, args.epochs + 1):
-        epoch_seconds.append(train_epoch(model, optimizer, train_batches, args.device, args.variant, epoch))
+        epoch_seconds.append(train_epoch(model, optimizer, train_batches, args.device, args.variant, epoch, scheduler))
         predicted = scores(model, tune_batches, args.device)
         if tuning_slates is None:
             metric = ndcg(attach_scores(tune_labels, predicted))["ndcg"]
@@ -272,7 +336,7 @@ def oof(args):
     if args.output.exists():
         raise FileExistsError(args.output)
     dataset = Feeds(args.data / "train", args.train_feeds, True, args.history_window, args.variant in HISTORY_VARIANTS,
-                    offset=args.train_offset)
+                    offset=args.train_offset, rich_features=args.variant in RICH_VARIANTS)
     timestamps = dataset.feeds["timestamp"].to_numpy()
     unique = np.unique(timestamps)
     if len(unique) < 3:
@@ -307,7 +371,8 @@ def predict(args):
     variant = checkpoint["variant"]
     model = Ranker(variant).to(args.device)
     model.load_state_dict(checkpoint["state_dict"])
-    test = Feeds(args.data / "test", 0, False, checkpoint["history_window"], variant in HISTORY_VARIANTS)
+    test = Feeds(args.data / "test", 0, False, checkpoint["history_window"], variant in HISTORY_VARIANTS,
+                 rich_features=variant in RICH_VARIANTS)
     template = pl.read_parquet(args.data / "sample_submission.parquet", columns=KEYS)
     submission = attach_scores(template, scores(model, loader(test, args.batch_size), args.device))
     args.output.parent.mkdir(parents=True, exist_ok=True)
