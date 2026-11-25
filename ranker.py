@@ -1,7 +1,10 @@
 """Train and apply a CatBoost ranker to Avito competition feeds."""
 
 import argparse
+from collections import deque
+from concurrent.futures import ProcessPoolExecutor
 import json
+import multiprocessing
 import os
 import warnings
 from pathlib import Path
@@ -33,6 +36,8 @@ FEED_CONTEXT_FEATURES = [
     "cat_share_in_feed", "f5_zscore", "f5_minus_max", "f5_cat_delta", "f3_zscore", "feed_size",
     "top5_f5_cosine", "din_long_max_cosine", "din_long_ev_other_max",
 ]
+TOP_F5 = "top5_f5_cosine"
+TOP_F5_WITH_TIES = "top5_f5_cosine_ties"
 SIM_FEATURES = ["sim_top16_cosine", "sim_recent_cosine", "sim_matching_category_share"]
 MIND_FEATURES = ["mind_best_cosine", "mind_category_cosine", "mind_interest_count"]
 SIM_RANK_SOURCES = ["user_item_cosine", "recent_items_cosine", "din_max_cosine", "din_top3_cosine",
@@ -62,6 +67,9 @@ VARIANTS = {
     "din-events-pos": [*FEATURES, *DIN_FEATURES, *EVENT_DIN_FEATURES, "pos_bias"],
     "din-events-v2": [*FEATURES, *DIN_FEATURES, *EVENT_DIN_FEATURES, *FEED_CONTEXT_FEATURES],
 }
+VARIANTS["din-events-v2-ties"] = [
+    TOP_F5_WITH_TIES if name == TOP_F5 else name for name in VARIANTS["din-events-v2"]
+]
 VARIANTS["strong-gbdt"] = [*FEATURES, *CATEGORY_TREND_FEATURES, *SIM_FEATURES, *behavior.FEATURES["strong-gbdt"]]
 STACK_FEATURES = ["stack_joint_z", "stack_gru_z"]
 STACK_VARIANTS = ("stack-base", "stack-gbdt")
@@ -158,6 +166,22 @@ def event_din_features(items, history_items, event_types, event_sources, positio
     return np.stack([decayed.max(axis=1), best_type, best_source, ev1_max, other_max, strong_max]).astype(np.float32)
 
 
+def top_f5_prototype(items, f5, item_indices, *, include_ties):
+    valid = np.flatnonzero(item_indices >= 0)
+    if not len(valid):
+        return np.zeros(len(items), dtype=np.float32)
+
+    top = valid[np.argsort(-f5[valid])[:5]]
+    if include_ties:
+        top = valid[f5[valid] >= f5[top[-1]]]
+        # Sum normalized vectors in database order for identical output after permutation.
+        top = top[np.argsort(item_indices[top])]
+    top_vectors = items[top]
+    norms = np.linalg.norm(top_vectors, axis=1, keepdims=True)
+    prototype = np.divide(top_vectors, norms, out=np.zeros_like(top_vectors), where=norms > 0).mean(axis=0)
+    return cosine(items, prototype)
+
+
 def vector_features(feed, embeddings, feature_names, reference, clusters=None):
     item_ids = np.asarray(feed["item_id"])
     categories = np.asarray(feed["category_id"])
@@ -216,17 +240,10 @@ def vector_features(feed, embeddings, feature_names, reference, clusters=None):
             positions[recent_vectors],
         )
         result.update(zip(EVENT_DIN_FEATURES, values, strict=True))
-    if "top5_f5_cosine" in feature_names:
+    top_feature = TOP_F5_WITH_TIES if TOP_F5_WITH_TIES in feature_names else TOP_F5
+    if top_feature in feature_names:
         f5 = np.nan_to_num(np.asarray(feed["f5"], dtype=np.float32), nan=-1e9)
-        valid_cand = np.flatnonzero(present)
-        if len(valid_cand):
-            top_k = valid_cand[np.argsort(-f5[valid_cand])[:min(5, len(valid_cand))]]
-            top_vecs = items[top_k]
-            norms = np.linalg.norm(top_vecs, axis=1, keepdims=True)
-            proto = np.divide(top_vecs, norms, out=np.zeros_like(top_vecs), where=norms > 0).mean(axis=0)
-            result["top5_f5_cosine"] = cosine(items, proto)
-        else:
-            result["top5_f5_cosine"] = np.zeros(len(item_ids), dtype=np.float32)
+        result[top_feature] = top_f5_prototype(items, f5, item_indices, include_ties=top_feature == TOP_F5_WITH_TIES)
     if "din_long_max_cosine" in feature_names:
         long_mask = ~recent_vectors
         long_items = history_items[long_mask]
@@ -327,8 +344,34 @@ def open_embeddings(split):
                      shape=tuple(metadata["shape"]), order=metadata["order"])
 
 
+_worker_embeddings = None
+
+
+def init_feature_worker(split):
+    global _worker_embeddings
+    _worker_embeddings = open_embeddings(split)
+
+
+def expand_in_worker(feeds, labeled, features):
+    return expand_batch(feeds, _worker_embeddings, labeled, features, None)
+
+
+def parallel_candidates(split, batches, labeled, features, workers):
+    # Bound outstanding frames and yield them in input order for CatBoost groups.
+    pending = deque()
+    with ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context("spawn"),
+                             initializer=init_feature_worker, initargs=(split,)) as pool:
+        for batch in batches:
+            pending.append(pool.submit(expand_in_worker, batch, labeled, features))
+            if len(pending) == 2 * workers:
+                yield pending.popleft().result()
+        while pending:
+            yield pending.popleft().result()
+
+
 def candidate_batches(split, *, features=FEATURES, labeled=False, max_feeds=0,
-                      reference=None, after=None, before=None, centers=None, device="cpu", offset=0):
+                      reference=None, after=None, before=None, centers=None, device="cpu", offset=0,
+                      feature_workers=1):
     columns = ["feed_id", "user_embedding", *CANDIDATE_COLUMNS]
     if "history_length" in features:
         columns.extend(HISTORY_COLUMNS)
@@ -344,6 +387,21 @@ def candidate_batches(split, *, features=FEATURES, labeled=False, max_feeds=0,
         columns.append("target")
     if after is not None or before is not None:
         columns.append("timestamp")
+    def selected_batches():
+        for batch in feed_batches(split, columns, max_feeds, offset=offset):
+            if after is not None:
+                batch = batch.filter(pl.col("timestamp") >= after)
+            if before is not None:
+                batch = batch.filter(pl.col("timestamp") < before)
+            if batch.height:
+                yield batch
+
+    if feature_workers > 1:
+        if reference is not None or centers is not None:
+            raise ValueError("Parallel feature workers require features without fitted reference or cluster centers")
+        yield from parallel_candidates(split, selected_batches(), labeled, features, feature_workers)
+        return
+
     embeddings = open_embeddings(split)
     clusters = None
     if centers is not None:
@@ -354,13 +412,8 @@ def candidate_batches(split, *, features=FEATURES, labeled=False, max_feeds=0,
             batch[key].explode().unique().to_numpy() for batch in batches for key in (candidate_key, history_key)
         ]))
         clusters = embedding_clusters.assign(embeddings, centers, device, indices[indices >= 0].astype(np.intp))
-    for batch in feed_batches(split, columns, max_feeds, offset=offset):
-        if after is not None:
-            batch = batch.filter(pl.col("timestamp") >= after)
-        if before is not None:
-            batch = batch.filter(pl.col("timestamp") < before)
-        if batch.height:
-            yield expand_batch(batch, embeddings, labeled, features, reference, clusters)
+    for batch in selected_batches():
+        yield expand_batch(batch, embeddings, labeled, features, reference, clusters)
 
 
 def read_candidates(split, **kwargs):
@@ -381,7 +434,9 @@ def load_training(args, features, centers=None):
     selection = {"max_feeds": args.train_feeds, "offset": args.train_offset}
     if kind is None:
         return read_candidates(split, features=features, labeled=True, centers=centers,
-                               device=args.device, **selection), None
+                               device=args.device, feature_workers=args.feature_workers, **selection), None
+    if args.feature_workers > 1:
+        raise ValueError("Parallel feature workers require a ranker without a fitted behavior reference")
 
     columns = ["timestamp", "user_id", "item_id", "category_id", "target", *HISTORY_COLUMNS[:2]]
     feeds = list(feed_batches(split, columns, **selection))
@@ -442,7 +497,7 @@ def select_gpu_checkpoint(model, tuning, val_pool, args):
 
     metric = gpu_ndcg_evaluator(tuning)
     step = max(1, args.iterations // 20)
-    if args.variant != "din-events-v2":
+    if args.variant not in {"din-events-v2", "din-events-v2-ties"}:
         step = min(5, step)
     checkpoints = sorted({1, model.tree_count_, *range(step, model.tree_count_, step)})
     full_prediction = try_gpu_scores(model, val_pool, args.threads)
@@ -512,7 +567,7 @@ def train(args):
         raise FileExistsError(args.output)
 
     features = VARIANTS[args.variant]
-    print(f"Preparing features for {args.variant} ({args.device})", flush=True)
+    print(f"Preparing features for {args.variant} ({args.device}, CPU workers={args.feature_workers})", flush=True)
     centers = train_centers(args) if args.variant == "embedding-clusters" else None
     training, reference = load_training(args, features, centers)
     if args.variant == "history-distill":
@@ -523,7 +578,8 @@ def train(args):
     train_pool = make_pool(training, features, args.threads, labeled=True)
     del training
     val = read_candidates(args.data / "val", features=features, labeled=True, max_feeds=args.val_feeds,
-                          reference=reference, centers=centers, device=args.device)
+                          reference=reference, centers=centers, device=args.device,
+                          feature_workers=args.feature_workers)
     if args.variant == "stack-gbdt":
         val = with_stack_scores(val, args.stack_val)
     tuning = val
@@ -596,7 +652,7 @@ def predict(args):
     reference = behavior.Reference.load(kind, args.model.with_name("behavior.npz")) if kind else None
     centers = np.load(args.model.with_name("centers.npy"), allow_pickle=False) if CLUSTER_FEATURES[0] in model.feature_names_ else None
     batches = candidate_batches(args.data / "test", features=model.feature_names_, reference=reference,
-                                centers=centers, device=args.device)
+                                centers=centers, device=args.device, feature_workers=args.feature_workers)
     if STACK_FEATURES[0] in model.feature_names_:
         if not args.stack_predictions:
             raise ValueError("stack-gbdt needs avito-joint and gru-din test scores in --stack-predictions")
@@ -632,14 +688,16 @@ def main():
         command.add_argument("--data", type=Path, required=True)
         command.add_argument("--output", type=Path, required=True)
         command.add_argument("--threads", type=int, default=4)
+        command.add_argument("--feature-workers", type=int, default=1,
+                             help="Parallel CPU feature expansion for models without fitted references")
         command.add_argument("--device", choices=["cpu", "gpu"])
         command.add_argument("--gpu", "--gpu-id", dest="gpu_id", help="NVIDIA index or UUID from nvidia-smi")
 
     args = parser.parse_args()
     if min(getattr(args, name, 0) for name in ("train_feeds", "val_feeds", "train_offset")) < 0:
         parser.error("Feed limits and offset must be nonnegative")
-    if args.threads < 1 or getattr(args, "iterations", 1) < 1:
-        parser.error("Threads and iterations must be positive")
+    if min(args.threads, args.feature_workers, getattr(args, "iterations", 1)) < 1:
+        parser.error("Threads, feature workers and iterations must be positive")
     if args.gpu_id is not None and args.device == "cpu":
         parser.error("--gpu cannot be combined with --device cpu")
     args.device = args.device or ("gpu" if args.gpu_id is not None else "cpu")

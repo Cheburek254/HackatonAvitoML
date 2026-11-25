@@ -43,7 +43,7 @@ def complete(report):
     return report.is_file() and json.loads(report.read_text(encoding="utf-8")).get("complete")
 
 
-def run_stage(args, key, directory, models, label, command):
+def run_stage(args, key, directory, models, label, command, *, watch_root=None):
     if complete(directory / "report.json"):
         note(f"Reusing completed {key}")
         return
@@ -52,7 +52,7 @@ def run_stage(args, key, directory, models, label, command):
     config = dict(report=str(directory / "report.json"), log=str(log), status=str(status),
                   data=str(args.data), models=models, epochs=5, iterations=600, label=label)
     with log.open("wb") as out:
-        atomic_text(args.catboost / "watch.json", json.dumps(config))
+        atomic_text((watch_root if watch_root is not None else args.catboost) / "watch.json", json.dumps(config))
         note(f"Starting {key}")
         code = 1
         try:

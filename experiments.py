@@ -18,7 +18,8 @@ from evaluation import KEYS, attach_scores, blend, ndcg
 from ranker import STACK_VARIANTS, VARIANTS, feed_batches
 
 NEURAL = ("transformer", "transformer-listmle", "avito-joint", "neural-din", "bst", "gru-din", "sasrec",
-          "set-transformer", "neural-pairwise", "neural-din-plus", "gru-din-plus")
+          "set-transformer", "neural-pairwise", "neural-din-plus", "gru-din-plus",
+          "neural-din-plus-ties", "gru-din-plus-ties")
 OFFICIAL = ("avito-catboost", "avito-transformer")
 CUDA_NEURAL = ("dual-history",)
 LIGHTGBM = "lgbm-din-events-v2"
@@ -127,6 +128,7 @@ def run_model(args, name, output, tune_ids, cutoff, extra=()):
         return pl.read_parquet(output / "val_predictions.parquet")
 
     script = "ranker.py" if name in VARIANTS else "neural.py"
+    environment = None
     command = [sys.executable, "-u", "-X", "utf8", str(Path(__file__).with_name(script)), "train", "--variant", name,
                "--data", str(args.data), "--output", str(output), "--train-feeds", str(args.train_feeds),
                "--val-feeds", str(args.val_feeds), "--tune-before", str(cutoff), "--threads", str(args.threads)]
@@ -138,6 +140,9 @@ def run_model(args, name, output, tune_ids, cutoff, extra=()):
     elif name in VARIANTS:
         device = "cpu" if name == "lambda" else args.cat_device
         command.extend(["--iterations", str(args.iterations), "--device", device])
+        if args.feature_workers > 1:
+            command.extend(["--feature-workers", str(args.feature_workers)])
+            environment = dict(os.environ, POLARS_MAX_THREADS="2", OPENBLAS_NUM_THREADS="1")
     else:
         command.extend(["--epochs", str(args.epochs), "--batch-size", str(args.batch_size),
                         "--device", args.neural_device, "--history-window", str(args.history_window)])
@@ -145,7 +150,7 @@ def run_model(args, name, output, tune_ids, cutoff, extra=()):
             command.append("--prefetch")
     if args.train_offset:
         command.extend(["--train-offset", str(args.train_offset)])
-    subprocess.run([*command, *extra], check=True)
+    subprocess.run([*command, *extra], check=True, env=environment)
     return pl.read_parquet(output / "val_predictions.parquet")
 
 
@@ -308,6 +313,8 @@ def run_benchmark(args, labels, cutoff, tune_ids, metric, selected):
                "reuse_models_from": [str(path) for path in args.reuse_models_from], "no_rrf": args.no_rrf}
     if args.prefetch_neural:
         options["prefetch_neural"] = True
+    if args.feature_workers > 1:
+        options["feature_workers"] = args.feature_workers
     report_path = args.output / "report.json"
     if args.resume and report_path.is_file():
         previous = json.loads(report_path.read_text(encoding="utf-8"))
@@ -430,6 +437,7 @@ def main():
     run.add_argument("--optuna-trials", type=int, default=48)
     run.add_argument("--no-rrf", action="store_true")
     run.add_argument("--prefetch-neural", action="store_true", help="Prepare the next CPU batch for neural.py")
+    run.add_argument("--feature-workers", type=int, default=1, help="CPU processes for CatBoost feature preparation")
     run.set_defaults(action=benchmark)
     diagnostic = commands.add_parser("diagnose")
     diagnostic.set_defaults(action=diagnose)
@@ -465,7 +473,8 @@ def main():
             parser.error("--family-blends needs strong-gbdt, a listwise model, and a sequence model")
         if len(set(args.models)) != len(args.models) or set(OFFICIAL) & set(args.models) and not args.baseline_zip:
             parser.error("Models must be unique and official models require --baseline-zip")
-        if min(args.batch_size, args.dual_batch_size, args.epochs, args.iterations, args.threads) < 1 or not 1 <= args.history_window <= 256:
+        if min(args.batch_size, args.dual_batch_size, args.epochs, args.iterations, args.threads,
+               args.feature_workers) < 1 or not 1 <= args.history_window <= 256:
             parser.error("Iterations, epochs, batch size and threads must be positive and history window must be 1–256")
     if args.action == blend_submission and not 0 <= args.weight <= 1:
         parser.error("Weight must be between 0 and 1")

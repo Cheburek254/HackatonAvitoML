@@ -252,6 +252,16 @@ $round = 'avito-full-v1'
 
 Для предсказания CatBoost на GPU добавьте к `ranker.py predict` аргументы `--device gpu --gpu-id 0`. Для двух окон истории используйте `dual_history.py predict --gpu-id 0` с путём к `model.safetensors`.
 
+## Проверка порядка кандидатов
+
+`candidate_order_ablation.py` сравнивает исходные `din-events-v2`, `neural-din-plus` и `gru-din-plus` с вариантами `-ties` на первых 200 000 лентах и общем временном разбиении val. CatBoost включает в прототип всех кандидатов, разделивших пятое место по `f5`. Нейросети используют средние ранги при совпадениях. Скрипт включает предзагрузку батчей и выполняет прогоны последовательно на выбранной дискретной карте. Для GRU можно переиспользовать проверенный контроль с тем же бюджетом через `--reuse-gru`.
+
+```powershell
+.\.venv\Scripts\python.exe candidate_order_ablation.py --data C:/study/AvitoData/competition --output runs/avito-real/candidate-order-200k --gpu 0 --ui --reuse-gru runs/avito-real/gru-pair-third/gru-fit --report-round avito-pilots
+```
+
+Итоги и парные бутстрэп-интервалы по пользователям появятся в `comparison/report.json`. Для нейросетей используется окно 32, батч 16 и бюджет в пять эпох. Для CatBoost бюджет составляет 600 деревьев. Три CPU-процесса параллельно готовят небольшие блоки признаков из общего memmap. Опция `--feature-workers` в `experiments.py benchmark` задаёт число процессов для CatBoost без обучаемых справочников и кластеров. Поздняя val используется для сравнения после отбора чекпоинтов на ранней. Дообучения на val нет.
+
 ## Варианты экспериментов
 
 | Вариант | Что проверяет |
