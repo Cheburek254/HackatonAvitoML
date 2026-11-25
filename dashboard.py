@@ -16,7 +16,7 @@ from tkinter import filedialog, messagebox, ttk
 from uuid import uuid4
 
 from accelerator import nvidia_gpus
-from experiments import GPU_ABLATION
+from experiments import GPU_ABLATION, LIGHTGBM
 
 ROOT = Path(__file__).resolve().parent
 BG, PANEL, BORDER = "#111820", "#1a2530", "#324251"
@@ -24,6 +24,7 @@ TEXT, MUTED, ACCENT = "#f2f5f8", "#aebdca", "#6ee7bc"
 TUNING = re.compile(r"^(\S+) (?:trees|epoch)=(\d+) tuning_ndcg=([\d.]+)")
 BATCH = re.compile(r"epoch=(\d+) batch=(\d+)/(\d+)")
 TREE = re.compile(r"^(\d+):\s")
+LIGHTGBM_TREE = re.compile(r"^\[(\d+)\]\s")
 
 
 def command_for(data, output, gpu, models, iterations, epochs, train_feeds, val_feeds, *, prefetch=False):
@@ -63,7 +64,7 @@ class Dashboard:
         self.prefetch = tk.BooleanVar(value=False)
         self.train_feeds, self.val_feeds = tk.StringVar(value="0"), tk.StringVar(value="0")
         self.selection = {name: tk.BooleanVar(value=name in GPU_ABLATION)
-                          for name in (*GPU_ABLATION, "din-events-v2", "gru-din-plus", "neural-din-plus")}
+                          for name in (*GPU_ABLATION, "din-events-v2", "gru-din-plus", "neural-din-plus", LIGHTGBM)}
         self.status = tk.StringVar(value="Готово к запуску")
         self.sample = tk.StringVar()
         self.stage = tk.StringVar(value="")
@@ -376,6 +377,10 @@ class Dashboard:
             step = int(match[1]) + 1
             self.stage.set(f"Дерево {step} из {self.budget[0]}")
             self.model_progress.set(75 * step / self.budget[0])
+        elif match := LIGHTGBM_TREE.match(line):
+            step = int(match[1])
+            self.stage.set(f"LightGBM · дерево {step} из {self.budget[0]}")
+            self.model_progress.set(100 * step / self.budget[0])
         elif line.startswith("Finished "):
             self.completed.add(line.split()[1].rstrip(":"))
             self.progress.set(100 * len(self.completed) / len(self.models))

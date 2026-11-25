@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -431,6 +432,8 @@ def raw_scores(model, pool, threads, device):
         prediction = try_gpu_scores(model, pool, threads)
         if prediction is not None:
             return prediction
+        warnings.warn("CatBoost computes unsupported categorical splits on CPU at prediction time.",
+                      RuntimeWarning, stacklevel=2)
     return CatBoost.predict(model, pool, thread_count=threads, task_type="CPU")
 
 
@@ -629,26 +632,28 @@ def main():
         command.add_argument("--data", type=Path, required=True)
         command.add_argument("--output", type=Path, required=True)
         command.add_argument("--threads", type=int, default=4)
-        command.add_argument("--device", choices=["cpu", "gpu"], default="cpu")
-        command.add_argument("--gpu-id", help="NVIDIA index or UUID from nvidia-smi")
+        command.add_argument("--device", choices=["cpu", "gpu"])
+        command.add_argument("--gpu", "--gpu-id", dest="gpu_id", help="NVIDIA index or UUID from nvidia-smi")
 
     args = parser.parse_args()
     if min(getattr(args, name, 0) for name in ("train_feeds", "val_feeds", "train_offset")) < 0:
         parser.error("Feed limits and offset must be nonnegative")
     if args.threads < 1 or getattr(args, "iterations", 1) < 1:
         parser.error("Threads and iterations must be positive")
+    if args.gpu_id is not None and args.device == "cpu":
+        parser.error("--gpu cannot be combined with --device cpu")
+    args.device = args.device or ("gpu" if args.gpu_id is not None else "cpu")
     if getattr(args, "variant", None) == "lambda" and args.device != "cpu":
         parser.error("CatBoost LambdaMart supports CPU training")
     if getattr(args, "variant", None) in STACK_VARIANTS and (
         not args.stack_train or (args.variant == "stack-gbdt" and not args.stack_val)
     ):
         parser.error("Stack variants require --stack-train; stack-gbdt also requires --stack-val")
-    if args.gpu_id:
+    if args.device == "gpu":
         from accelerator import select_gpu
 
-        if args.device != "gpu":
-            parser.error("--gpu-id requires --device gpu")
-        select_gpu(args.gpu_id)
+        selected = select_gpu(args.gpu_id)
+        print(f"CatBoost GPU: {selected.name} ({selected.uuid})", flush=True)
     args.run(args)
 
 

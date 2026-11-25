@@ -427,8 +427,12 @@ def main():
         command.add_argument("--output", type=Path, required=True)
         command.add_argument("--batch-size", type=int, default=16)
         command.add_argument("--threads", type=int, default=4)
-        command.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
+        command.add_argument("--device", choices=["cpu", "cuda"])
+        command.add_argument("--gpu", "--gpu-id", dest="gpu", help="NVIDIA index or UUID")
     args = parser.parse_args()
+    if args.gpu is not None and args.device == "cpu":
+        parser.error("--gpu cannot be combined with --device cpu")
+    args.device = args.device or ("cuda" if args.gpu is not None else "cpu")
     if min(args.batch_size, args.threads, getattr(args, "epochs", 1)) < 1:
         parser.error("Batch size, threads and epochs must be positive")
     if (not 1 <= getattr(args, "history_window", 1) <= 256
@@ -436,6 +440,10 @@ def main():
         parser.error("History window must be 1–256 and feed limits and offset must be nonnegative")
     torch.set_num_threads(args.threads)
     if args.device == "cuda":
+        from accelerator import select_gpu
+
+        selected = select_gpu(args.gpu)
+        print(f"PyTorch GPU: {selected.name} ({selected.uuid})", flush=True)
         if not torch.cuda.is_available():
             parser.error("CUDA PyTorch is required for --device cuda")
         torch.set_float32_matmul_precision("high")

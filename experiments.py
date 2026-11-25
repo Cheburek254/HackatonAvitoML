@@ -21,6 +21,7 @@ NEURAL = ("transformer", "transformer-listmle", "avito-joint", "neural-din", "bs
           "set-transformer", "neural-pairwise", "neural-din-plus", "gru-din-plus")
 OFFICIAL = ("avito-catboost", "avito-transformer")
 CUDA_NEURAL = ("dual-history",)
+LIGHTGBM = "lgbm-din-events-v2"
 TREE_MODELS = tuple(name for name in VARIANTS if name not in STACK_VARIANTS)
 GPU_ABLATION = ("history", "category-trend", "category-trend-wide", "category-model", "popularity-trend",
                 "category-covis", "pixie-decays", "covis-pixie", "embedding-clusters", "history-distill", *CUDA_NEURAL)
@@ -67,6 +68,8 @@ def official_catboost(args, tune_ids, output):
     if args.cat_device == "cpu":
         params.pop("devices", None)
         params.pop("gpu_ram_part", None)
+    else:
+        params["devices"] = "0"
     model = baseline.CatBoostRanker(**params)
     model.fit(training, eval_set=pool, **baseline.FIT_PARAMS)
     output.mkdir(parents=True)
@@ -106,6 +109,22 @@ def run_model(args, name, output, tune_ids, cutoff, extra=()):
         predictions = runner(args, tune_ids, output)
         predictions.write_parquet(output / "val_predictions.parquet")
         return predictions
+
+    if name == LIGHTGBM:
+        script = Path(__file__).with_name("lgbm_ranker.py")
+        result = subprocess.run([sys.executable, "-u", "-X", "utf8", str(script), "train",
+                                 "--data", str(args.data), "--output", str(output), "--tune-before", str(cutoff),
+                                 "--train-feeds", str(args.train_feeds), "--train-offset", str(args.train_offset),
+                                 "--val-feeds", str(args.val_feeds), "--iterations", str(args.iterations),
+                                 "--threads", str(args.threads), *(["--gpu", args.gpu] if args.gpu else [])])
+        # The OpenCL runtime on Windows can crash during teardown. The trainer
+        # exposes this whole directory atomically after all three files are written.
+        if os.name == "nt" and args.gpu and result.returncode & 0xFFFFFFFF == 0xC0000005 and all(
+                (output / file).is_file() for file in ("model.txt", "metrics.json", "val_predictions.parquet")):
+            print("LightGBM OpenCL teardown failed after saving. Checking the saved validation predictions.", flush=True)
+        else:
+            result.check_returncode()
+        return pl.read_parquet(output / "val_predictions.parquet")
 
     script = "ranker.py" if name in VARIANTS else "neural.py"
     command = [sys.executable, "-u", "-X", "utf8", str(Path(__file__).with_name(script)), "train", "--variant", name,
@@ -245,6 +264,7 @@ def benchmark(args):
         from accelerator import cuda_tensor, gpu_ndcg, has_torch_cuda, select_gpu
 
         selected = select_gpu(args.gpu)
+        args.gpu = selected.uuid
         print(f"GPU: {selected.name} ({selected.memory})", flush=True)
         if not has_torch_cuda():
             cuda_tensor()
@@ -324,7 +344,7 @@ def run_benchmark(args, labels, cutoff, tune_ids, metric, selected):
         stats = json.loads(metrics_path.read_text(encoding="utf-8")) if metrics_path.is_file() else {}
         results.append({"model": name, **scores, "seconds": round(perf_counter() - start, 2),
                         **{key: stats[key] for key in ("train_feeds", "peak_ram_mib", "peak_private_mib",
-                                                      "tuning_curve", "epoch_seconds")
+                                                      "tuning_curve", "epoch_seconds", "best_iteration")
                            if key in stats}})
         files[name] = output / "val_predictions.parquet"
         save_report(report_path, report, results)
@@ -390,7 +410,7 @@ def main():
     commands = parser.add_subparsers(required=True)
     run = commands.add_parser("benchmark")
     run.add_argument("--output", type=Path, required=True)
-    run.add_argument("--models", choices=(*OFFICIAL, *TREE_MODELS, *NEURAL, *CUDA_NEURAL), nargs="+")
+    run.add_argument("--models", choices=(*OFFICIAL, *TREE_MODELS, LIGHTGBM, *NEURAL, *CUDA_NEURAL), nargs="+")
     run.add_argument("--baseline-zip", type=Path)
     run.add_argument("--iterations", type=int, default=500)
     run.add_argument("--epochs", type=int, default=5)
