@@ -1,0 +1,9 @@
+{
+  "code_revision": "b47fdcbf617a5528ce365d6bab8f714670a9ff2c",
+  "checkpoints": {
+    "din-events-v3-qsm/model.cbm": {
+      "bytes": 1885508,
+      "sha256": "768187945dab945d8434bf3a51f00424125f718a19037a082b2a2e23aa960a34"
+    }
+  }
+}
