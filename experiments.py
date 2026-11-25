@@ -18,9 +18,11 @@ from evaluation import KEYS, attach_scores, blend, ndcg
 from ranker import STACK_VARIANTS, VARIANTS, feed_batches
 
 NEURAL = ("transformer", "transformer-listmle", "avito-joint", "neural-din", "bst", "gru-din", "sasrec",
-          "set-transformer", "neural-pairwise", "neural-din-plus", "gru-din-plus", "gru-din-v3")
+          "set-transformer", "neural-pairwise", "neural-din-plus", "gru-din-plus", "gru-din-v3",
+          "neural-din-plus-ties", "gru-din-plus-ties")
 OFFICIAL = ("avito-catboost", "avito-transformer")
 CUDA_NEURAL = ("dual-history",)
+LIGHTGBM = "lgbm-din-events-v2"
 TREE_MODELS = tuple(name for name in VARIANTS if name not in STACK_VARIANTS)
 GPU_ABLATION = ("history", "category-trend", "category-trend-wide", "category-model", "popularity-trend",
                 "category-covis", "pixie-decays", "covis-pixie", "embedding-clusters", "history-distill", *CUDA_NEURAL)
@@ -67,6 +69,8 @@ def official_catboost(args, tune_ids, output):
     if args.cat_device == "cpu":
         params.pop("devices", None)
         params.pop("gpu_ram_part", None)
+    else:
+        params["devices"] = "0"
     model = baseline.CatBoostRanker(**params)
     model.fit(training, eval_set=pool, **baseline.FIT_PARAMS)
     output.mkdir(parents=True)
@@ -107,7 +111,24 @@ def run_model(args, name, output, tune_ids, cutoff, extra=()):
         predictions.write_parquet(output / "val_predictions.parquet")
         return predictions
 
+    if name == LIGHTGBM:
+        script = Path(__file__).with_name("lgbm_ranker.py")
+        result = subprocess.run([sys.executable, "-u", "-X", "utf8", str(script), "train",
+                                 "--data", str(args.data), "--output", str(output), "--tune-before", str(cutoff),
+                                 "--train-feeds", str(args.train_feeds), "--train-offset", str(args.train_offset),
+                                 "--val-feeds", str(args.val_feeds), "--iterations", str(args.iterations),
+                                 "--threads", str(args.threads), *(["--gpu", args.gpu] if args.gpu else [])])
+        # The OpenCL runtime on Windows can crash during teardown. The trainer
+        # exposes this whole directory atomically after all three files are written.
+        if os.name == "nt" and args.gpu and result.returncode & 0xFFFFFFFF == 0xC0000005 and all(
+                (output / file).is_file() for file in ("model.txt", "metrics.json", "val_predictions.parquet")):
+            print("LightGBM OpenCL teardown failed after saving. Checking the saved validation predictions.", flush=True)
+        else:
+            result.check_returncode()
+        return pl.read_parquet(output / "val_predictions.parquet")
+
     script = "ranker.py" if name in VARIANTS else "neural.py"
+    environment = None
     command = [sys.executable, "-u", "-X", "utf8", str(Path(__file__).with_name(script)), "train", "--variant", name,
                "--data", str(args.data), "--output", str(output), "--train-feeds", str(args.train_feeds),
                "--val-feeds", str(args.val_feeds), "--tune-before", str(cutoff), "--threads", str(args.threads)]
@@ -119,12 +140,17 @@ def run_model(args, name, output, tune_ids, cutoff, extra=()):
     elif name in VARIANTS:
         device = "cpu" if name == "lambda" else args.cat_device
         command.extend(["--iterations", str(args.iterations), "--device", device])
+        if args.feature_workers > 1:
+            command.extend(["--feature-workers", str(args.feature_workers)])
+            environment = dict(os.environ, POLARS_MAX_THREADS="2", OPENBLAS_NUM_THREADS="1")
     else:
         command.extend(["--epochs", str(args.epochs), "--batch-size", str(args.batch_size),
                         "--device", args.neural_device, "--history-window", str(args.history_window)])
+        if args.prefetch_neural:
+            command.append("--prefetch")
     if args.train_offset:
         command.extend(["--train-offset", str(args.train_offset)])
-    subprocess.run([*command, *extra], check=True)
+    subprocess.run([*command, *extra], check=True, env=environment)
     return pl.read_parquet(output / "val_predictions.parquet")
 
 
@@ -243,6 +269,7 @@ def benchmark(args):
         from accelerator import cuda_tensor, gpu_ndcg, has_torch_cuda, select_gpu
 
         selected = select_gpu(args.gpu)
+        args.gpu = selected.uuid
         print(f"GPU: {selected.name} ({selected.memory})", flush=True)
         if not has_torch_cuda():
             cuda_tensor()
@@ -284,6 +311,10 @@ def run_benchmark(args, labels, cutoff, tune_ids, metric, selected):
                "baseline_zip": str(args.baseline_zip) if args.baseline_zip else None,
                "family_blends": args.family_blends, "stack": args.stack, "optuna_trials": args.optuna_trials,
                "reuse_models_from": [str(path) for path in args.reuse_models_from], "no_rrf": args.no_rrf}
+    if args.prefetch_neural:
+        options["prefetch_neural"] = True
+    if args.feature_workers > 1:
+        options["feature_workers"] = args.feature_workers
     report_path = args.output / "report.json"
     if args.resume and report_path.is_file():
         previous = json.loads(report_path.read_text(encoding="utf-8"))
@@ -320,7 +351,7 @@ def run_benchmark(args, labels, cutoff, tune_ids, metric, selected):
         stats = json.loads(metrics_path.read_text(encoding="utf-8")) if metrics_path.is_file() else {}
         results.append({"model": name, **scores, "seconds": round(perf_counter() - start, 2),
                         **{key: stats[key] for key in ("train_feeds", "peak_ram_mib", "peak_private_mib",
-                                                      "tuning_curve", "epoch_seconds")
+                                                      "tuning_curve", "epoch_seconds", "best_iteration")
                            if key in stats}})
         files[name] = output / "val_predictions.parquet"
         save_report(report_path, report, results)
@@ -388,7 +419,7 @@ def main():
     commands = parser.add_subparsers(required=True)
     run = commands.add_parser("benchmark")
     run.add_argument("--output", type=Path, required=True)
-    run.add_argument("--models", choices=(*OFFICIAL, *TREE_MODELS, *NEURAL, *CUDA_NEURAL), nargs="+")
+    run.add_argument("--models", choices=(*OFFICIAL, *TREE_MODELS, LIGHTGBM, *NEURAL, *CUDA_NEURAL), nargs="+")
     run.add_argument("--baseline-zip", type=Path)
     run.add_argument("--iterations", type=int, default=500)
     run.add_argument("--epochs", type=int, default=5)
@@ -407,6 +438,8 @@ def main():
     run.add_argument("--stack", action="store_true")
     run.add_argument("--optuna-trials", type=int, default=48)
     run.add_argument("--no-rrf", action="store_true")
+    run.add_argument("--prefetch-neural", action="store_true", help="Prepare the next CPU batch for neural.py")
+    run.add_argument("--feature-workers", type=int, default=1, help="CPU processes for CatBoost feature preparation")
     run.set_defaults(action=benchmark)
     diagnostic = commands.add_parser("diagnose")
     diagnostic.set_defaults(action=diagnose)
@@ -442,7 +475,8 @@ def main():
             parser.error("--family-blends needs strong-gbdt, a listwise model, and a sequence model")
         if len(set(args.models)) != len(args.models) or set(OFFICIAL) & set(args.models) and not args.baseline_zip:
             parser.error("Models must be unique and official models require --baseline-zip")
-        if min(args.batch_size, args.dual_batch_size, args.epochs, args.iterations, args.threads) < 1 or not 1 <= args.history_window <= 256:
+        if min(args.batch_size, args.dual_batch_size, args.epochs, args.iterations, args.threads,
+               args.feature_workers) < 1 or not 1 <= args.history_window <= 256:
             parser.error("Iterations, epochs, batch size and threads must be positive and history window must be 1–256")
     if args.action == blend_submission and not 0 <= args.weight <= 1:
         parser.error("Weight must be between 0 and 1")

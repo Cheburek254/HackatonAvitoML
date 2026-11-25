@@ -1,8 +1,11 @@
 """NVIDIA selection and CUDA tensor computations used by the benchmark."""
 
 import csv
+import ctypes
+from ctypes.util import find_library
 import os
 import subprocess
+import sys
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -31,12 +34,44 @@ def nvidia_gpus():
     return [GPU(*(field.strip() for field in row)) for row in csv.reader(result.stdout.splitlines())]
 
 
-def select_gpu(selection):
+def select_gpu(selection=None):
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if selection is None:
+        selection = "0" if visible is None else visible.partition(",")[0]
     selected = next((gpu for gpu in nvidia_gpus() if selection in (gpu.uuid, gpu.index)), None)
     if selected is None:
         raise ValueError(f"NVIDIA GPU {selection!r} unavailable; see nvidia-smi")
+    torch = sys.modules.get("torch")
+    if visible != selected.uuid and ((torch is not None and torch.cuda.is_initialized())
+                                     or cuda_tensor.cache_info().currsize):
+        raise ValueError("CUDA is already initialized. Select another GPU in a fresh process.")
     os.environ["CUDA_VISIBLE_DEVICES"] = selected.uuid
     return selected
+
+
+def opencl_ordinals():
+    """Enumerate devices for probing a backend's own OpenCL ordering."""
+    library = "OpenCL.dll" if os.name == "nt" else find_library("OpenCL")
+    if library is None:
+        raise ValueError("OpenCL is unavailable; install the GPU driver or select CPU")
+    try:
+        cl = (ctypes.WinDLL if os.name == "nt" else ctypes.CDLL)(library)
+    except OSError as error:
+        raise ValueError("OpenCL could not be loaded; check the GPU driver") from error
+    count = ctypes.c_uint()
+    if cl.clGetPlatformIDs(0, None, ctypes.byref(count)) != 0:
+        raise ValueError("No OpenCL platforms exposed by the GPU driver")
+    platforms = (ctypes.c_void_p * count.value)()
+    if cl.clGetPlatformIDs(count, platforms, None) != 0:
+        raise ValueError("Failed to enumerate OpenCL platforms")
+    device_counts = []
+    for platform in platforms:
+        devices = ctypes.c_uint()
+        code = cl.clGetDeviceIDs(ctypes.c_void_p(platform), ctypes.c_uint64(0xFFFFFFFF), 0, None,
+                                 ctypes.byref(devices))
+        device_counts.append(devices.value if code == 0 else 0)
+    # OpenCL libraries can enumerate the same platforms in a different order.
+    return [(p, d) for p in range(len(device_counts)) for d in range(max(device_counts, default=0))]
 
 
 @lru_cache(maxsize=1)

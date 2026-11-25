@@ -16,7 +16,7 @@ from tkinter import filedialog, messagebox, ttk
 from uuid import uuid4
 
 from accelerator import nvidia_gpus
-from experiments import GPU_ABLATION
+from experiments import GPU_ABLATION, LIGHTGBM
 
 ROOT = Path(__file__).resolve().parent
 BG, PANEL, BORDER = "#111820", "#1a2530", "#324251"
@@ -24,13 +24,14 @@ TEXT, MUTED, ACCENT = "#f2f5f8", "#aebdca", "#6ee7bc"
 TUNING = re.compile(r"^(\S+) (?:trees|epoch)=(\d+) tuning_ndcg=([\d.]+)")
 BATCH = re.compile(r"epoch=(\d+) batch=(\d+)/(\d+)")
 TREE = re.compile(r"^(\d+):\s")
+LIGHTGBM_TREE = re.compile(r"^\[(\d+)\]\s")
 
 
-def command_for(data, output, gpu, models, iterations, epochs, train_feeds, val_feeds):
+def command_for(data, output, gpu, models, iterations, epochs, train_feeds, val_feeds, *, prefetch=False):
     return [sys.executable, "-u", "-X", "utf8", str(ROOT / "experiments.py"), "benchmark",
             "--data", str(data), "--output", str(output), "--gpu", gpu, "--models", *models,
             "--iterations", str(iterations), "--epochs", str(epochs), "--train-feeds", str(train_feeds),
-            "--val-feeds", str(val_feeds), "--by-category"]
+            "--val-feeds", str(val_feeds), "--by-category", *(["--prefetch-neural"] if prefetch else [])]
 
 
 class Dashboard:
@@ -60,9 +61,10 @@ class Dashboard:
         self.data = tk.StringVar(value=str(ROOT / "runs" / "synthetic-v2" / "competition"))
         self.gpu = tk.StringVar()
         self.iterations, self.epochs = tk.StringVar(value="100"), tk.StringVar(value="5")
+        self.prefetch = tk.BooleanVar(value=False)
         self.train_feeds, self.val_feeds = tk.StringVar(value="0"), tk.StringVar(value="0")
         self.selection = {name: tk.BooleanVar(value=name in GPU_ABLATION)
-                          for name in (*GPU_ABLATION, "din-events-v2", "gru-din-plus", "neural-din-plus")}
+                          for name in (*GPU_ABLATION, "din-events-v2", "gru-din-plus", "neural-din-plus", LIGHTGBM)}
         self.status = tk.StringVar(value="Готово к запуску")
         self.sample = tk.StringVar()
         self.stage = tk.StringVar(value="")
@@ -137,6 +139,8 @@ class Dashboard:
             self.label(budgets, title).grid(row=row, column=0, sticky="w", pady=3)
             ttk.Entry(budgets, textvariable=value, width=9).grid(row=row, column=1, sticky="e", padx=(15, 0))
         budgets.columnconfigure(1, weight=1)
+        ttk.Checkbutton(budgets, text="Предзагрузка батчей нейросети", variable=self.prefetch).grid(
+            row=4, column=0, columnspan=2, sticky="w")
         self.label(controls, "Модели", strong=True).pack(fill="x", pady=(0, 4))
         for name, enabled in self.selection.items():
             ttk.Checkbutton(controls, text=name, variable=enabled).pack(anchor="w")
@@ -228,7 +232,8 @@ class Dashboard:
         self.draw_curve()
         self.clear_log()
         self.append(str(output))
-        command = command_for(data, output, gpu, models, iterations, epochs, train_feeds, val_feeds)
+        command = command_for(data, output, gpu, models, iterations, epochs, train_feeds, val_feeds,
+                              prefetch=self.prefetch.get())
         try:
             self.process = subprocess.Popen(
                 command, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8",
@@ -372,6 +377,10 @@ class Dashboard:
             step = int(match[1]) + 1
             self.stage.set(f"Дерево {step} из {self.budget[0]}")
             self.model_progress.set(75 * step / self.budget[0])
+        elif match := LIGHTGBM_TREE.match(line):
+            step = int(match[1])
+            self.stage.set(f"LightGBM · дерево {step} из {self.budget[0]}")
+            self.model_progress.set(100 * step / self.budget[0])
         elif line.startswith("Finished "):
             self.completed.add(line.split()[1].rstrip(":"))
             self.progress.set(100 * len(self.completed) / len(self.models))

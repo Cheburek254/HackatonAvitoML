@@ -169,15 +169,15 @@ def main():
     for command in (training, scoring):
         command.add_argument("--data", type=Path, required=True)
         command.add_argument("--output", type=Path, required=True)
-        command.add_argument("--gpu-id")
+        command.add_argument("--gpu", "--gpu-id", dest="gpu_id", help="NVIDIA index or UUID")
         command.add_argument("--batch-size", type=int, default=4096)
     args = parser.parse_args()
     if args.output.exists():
         raise FileExistsError(args.output)
     if args.batch_size < 1 or getattr(args, "epochs", 1) < 1 or min(getattr(args, "train_feeds", 0), getattr(args, "val_feeds", 0)) < 0:
         parser.error("Batch size and epochs must be positive, feed limits nonnegative")
-    if args.gpu_id:
-        select_gpu(args.gpu_id)
+    selected = select_gpu(args.gpu_id)
+    print(f"tinygrad GPU: {selected.name} ({selected.uuid})", flush=True)
     # Tinygrad needs the default set before nn layers allocate their parameters.
     cuda_tensor()
     from tinygrad import Device
