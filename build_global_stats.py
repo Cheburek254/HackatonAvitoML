@@ -15,6 +15,7 @@ def build(data_dir: Path, output_dir: Path, chunk_size: int = 32):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     item_aggs = []
+    hist_aggs = []
     user_aggs = []
     total_feeds = 0
     total_shows = 0
@@ -23,12 +24,12 @@ def build(data_dir: Path, output_dir: Path, chunk_size: int = 32):
     for i in range(0, len(parts), chunk_size):
         chunk = parts[i : i + chunk_size]
         df = pl.concat([
-            pl.read_parquet(p, columns=["user_id", "item_id", "pos", "target"])
+            pl.read_parquet(p, columns=["user_id", "item_id", "pos", "target", "history__item_id"])
             for p in chunk
         ])
         total_feeds += df.height
 
-        # User-level aggregation (per feed -> sum by user_id)
+        # User-level aggregation
         u_df = (
             df.filter(pl.col("user_id") > 0)
             .select(
@@ -45,7 +46,17 @@ def build(data_dir: Path, output_dir: Path, chunk_size: int = 32):
         )
         user_aggs.append(u_df)
 
-        # Item-level aggregation
+        # History item popularity (top 64 recent events per feed, target-free!)
+        h_df = (
+            df.select(pl.col("history__item_id").list.head(64).alias("item_id"))
+            .explode("item_id")
+            .filter(pl.col("item_id") > 0)
+            .group_by("item_id")
+            .agg(pl.len().cast(pl.Int32).alias("item_hist_count"))
+        )
+        hist_aggs.append(h_df)
+
+        # Candidate item-level aggregation
         exp = df.select("item_id", "pos", "target").explode("item_id", "pos", "target")
         total_shows += exp.height
         total_clicks += int(exp["target"].sum())
@@ -61,7 +72,6 @@ def build(data_dir: Path, output_dir: Path, chunk_size: int = 32):
         item_aggs.append(i_df)
         del df, exp
 
-        # Periodically compact intermediate tables to keep RAM tiny
         if len(item_aggs) >= 4:
             item_aggs = [
                 pl.concat(item_aggs)
@@ -71,6 +81,11 @@ def build(data_dir: Path, output_dir: Path, chunk_size: int = 32):
                     pl.col("item_clicks").sum(),
                     pl.col("item_pos_sum").sum(),
                 )
+            ]
+            hist_aggs = [
+                pl.concat(hist_aggs)
+                .group_by("item_id")
+                .agg(pl.col("item_hist_count").sum())
             ]
             user_aggs = [
                 pl.concat(user_aggs)
@@ -83,13 +98,27 @@ def build(data_dir: Path, output_dir: Path, chunk_size: int = 32):
             ]
         print(f"Processed {min(i + chunk_size, len(parts))}/{len(parts)} parts ({total_feeds:,} feeds) in {perf_counter() - start:.1f}s", flush=True)
 
-    item_stats = (
+    cand_stats = (
         pl.concat(item_aggs)
         .group_by("item_id")
         .agg(
             pl.col("item_shows").sum(),
             pl.col("item_clicks").sum(),
             pl.col("item_pos_sum").sum(),
+        )
+    )
+    hist_stats = (
+        pl.concat(hist_aggs)
+        .group_by("item_id")
+        .agg(pl.col("item_hist_count").sum())
+    )
+    item_stats = (
+        cand_stats.join(hist_stats, on="item_id", how="full", coalesce=True)
+        .with_columns(
+            pl.col("item_shows").fill_null(0).cast(pl.Int32),
+            pl.col("item_clicks").fill_null(0).cast(pl.Int32),
+            pl.col("item_pos_sum").fill_null(0).cast(pl.Int64),
+            pl.col("item_hist_count").fill_null(0).cast(pl.Int32),
         )
         .sort("item_id")
     )
@@ -113,15 +142,12 @@ def build(data_dir: Path, output_dir: Path, chunk_size: int = 32):
     )
     print(f"Saved item_stats ({item_stats.height:,} items) and user_stats ({user_stats.height:,} users), prior={prior:.5f}, time={perf_counter() - start:.1f}s", flush=True)
 
-    # Check real coverage on val and test!
     known_items = item_stats["item_id"]
-    known_users = user_stats["user_id"]
     for split in ("val", "test"):
         sp = sorted((data_dir / split / "impressions").glob("part-*.parquet"))
-        s_df = pl.concat([pl.read_parquet(p, columns=["user_id", "item_id"]) for p in sp])
-        u_cov = s_df["user_id"].is_in(known_users).mean()
+        s_df = pl.concat([pl.read_parquet(p, columns=["item_id"]) for p in sp])
         i_cov = s_df["item_id"].explode().is_in(known_items).mean()
-        print(f"Coverage on {split}: user_id={u_cov:.1%}, item_id={i_cov:.1%}", flush=True)
+        print(f"Item coverage on {split} (candidates + histories): {i_cov:.1%}", flush=True)
 
 
 def main():

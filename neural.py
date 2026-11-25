@@ -20,12 +20,13 @@ from ranker import BASE_FEATURES, CANDIDATE_COLUMNS, HISTORY_COLUMNS, feed_batch
 
 TIE_VARIANTS = ("neural-din-plus-ties", "gru-din-plus-ties")
 VARIANTS = ("transformer", "transformer-listmle", "avito-joint", "neural-din", "bst", "gru-din", "sasrec",
-            "set-transformer", "neural-pairwise", "neural-din-plus", "gru-din-plus", "gru-din-v3", *TIE_VARIANTS)
+            "set-transformer", "neural-pairwise", "neural-din-plus", "gru-din-plus", "gru-din-v3", "gru-din-v4", *TIE_VARIANTS)
 HISTORY_VARIANTS = {"avito-joint", "neural-din", "bst", "gru-din", "sasrec", "neural-pairwise",
-                    "neural-din-plus", "gru-din-plus", "gru-din-v3", *TIE_VARIANTS}
-RICH_VARIANTS = {"neural-din-plus", "gru-din-plus", "gru-din-v3", *TIE_VARIANTS}
-GRU_VARIANTS = {"gru-din", "gru-din-plus", "gru-din-v3", "gru-din-plus-ties"}
-V3_VARIANTS = {"gru-din-v3"}
+                    "neural-din-plus", "gru-din-plus", "gru-din-v3", "gru-din-v4", *TIE_VARIANTS}
+RICH_VARIANTS = {"neural-din-plus", "gru-din-plus", "gru-din-v3", "gru-din-v4", *TIE_VARIANTS}
+GRU_VARIANTS = {"gru-din", "gru-din-plus", "gru-din-v3", "gru-din-v4", "gru-din-plus-ties"}
+V3_VARIANTS = {"gru-din-v3", "gru-din-v4"}
+V4_VARIANTS = {"gru-din-v4"}
 
 
 def id_tensor(values):
@@ -52,20 +53,43 @@ def candidate_percentiles(values, *, average_ties=False):
     return torch.empty_like(values).scatter_(0, indices, midpoints)
 
 
+def load_global_stats_for_neural():
+    stats_dir = Path(__file__).resolve().parent / "runs" / "global_stats"
+    path = stats_dir / "item_stats.parquet"
+    if not path.is_file():
+        raise FileNotFoundError(f"Global stats not found at {path}; run build_global_stats.py first")
+    meta = json.loads((stats_dir / "meta.json").read_text(encoding="utf-8"))
+    df = pl.read_parquet(path)
+    hist_col = df["item_hist_count"].to_numpy() if "item_hist_count" in df.columns else np.zeros(df.height, dtype=np.int32)
+    return (
+        df["item_id"].to_numpy(),
+        df["item_shows"].to_numpy(),
+        df["item_clicks"].to_numpy(),
+        df["item_pos_sum"].to_numpy(),
+        hist_col,
+        float(meta["prior"]),
+    )
+
+
 class Feeds(Dataset):
     def __init__(self, split, max_feeds, labeled, window, uses_history, *, offset=0, rich_features=False,
-                 v3_features=False, average_ties=False):
+                 v3_features=False, v4_features=False, average_ties=False):
         columns = ["feed_id", "timestamp", "user_embedding", *CANDIDATE_COLUMNS]
         if labeled:
             columns.append("target")
         if uses_history:
             columns.extend([*HISTORY_COLUMNS, "history__event_type", "history__event_source"])
+        self.is_train = split.name == "train"
+        if v4_features and self.is_train:
+            columns.append("pos")
         self.feeds = pl.concat(list(feed_batches(split, columns, max_feeds, offset=offset)))
         self.embeddings = open_embeddings(split)
         self.labeled = labeled
         self.window = window if uses_history else 0
         self.rich_features = rich_features
-        self.v3_features = v3_features
+        self.v3_features = v3_features or v4_features
+        self.v4_features = v4_features
+        self.global_stats = load_global_stats_for_neural() if v4_features else None
         self.average_ties = average_ties
 
     def __len__(self):
@@ -162,7 +186,35 @@ class Feeds(Dataset):
                         other_m = tail_ev > 1
                         if other_m.any():
                             v3[:, 8] = tail_sims[:, other_m].max(dim=1).values
-                candidates = torch.cat([floats, pct, u_cos, extra, v3, items, missing[:, None]], dim=-1)
+                if self.v4_features and self.global_stats is not None:
+                    g_ids, g_shows, g_clicks, g_pos_sum, g_hist, prior = self.global_stats
+                    i_arr = np.asarray(feed["item_id"], dtype=np.int32)
+                    idx = np.searchsorted(g_ids, i_arr)
+                    clipped = np.minimum(idx, len(g_ids) - 1)
+                    found = (i_arr > 0) & (g_ids[clipped] == i_arr)
+                    shows = np.where(found, g_shows[clipped], 0).astype(np.float64)
+                    clicks = np.where(found, g_clicks[clipped], 0).astype(np.float64)
+                    pos_sum = np.where(found, g_pos_sum[clipped], 0).astype(np.float64)
+                    hist_c = np.where(found, g_hist[clipped], 0).astype(np.float64)
+                    if self.is_train and self.labeled:
+                        shows = np.maximum(shows - 1.0, 0.0)
+                        clicks = np.maximum(clicks - np.asarray(feed["target"], dtype=np.float64), 0.0)
+                        if "pos" in feed:
+                            pos_sum = np.maximum(pos_sum - np.asarray(feed["pos"], dtype=np.float64), 0.0)
+                    shows_log = np.log1p(shows) / 10.0
+                    ctr = (clicks + 30.0 * prior) / (shows + 30.0)
+                    mean_pos = (pos_sum + 20.0 * 40.0) / (shows + 20.0)
+                    ctr_scaled = (ctr - prior) * 20.0
+                    pos_scaled = (mean_pos - 40.0) / 40.0
+                    ctr_delta = ctr_scaled - ctr_scaled.mean()
+                    pos_delta = pos_scaled - pos_scaled.mean()
+                    hist_log = np.log1p(hist_c) / 10.0
+                    v4 = torch.from_numpy(
+                        np.stack([shows_log, ctr_scaled, pos_scaled, ctr_delta, pos_delta, hist_log], axis=1).astype(np.float32)
+                    )
+                    candidates = torch.cat([floats, pct, u_cos, extra, v3, v4, items, missing[:, None]], dim=-1)
+                else:
+                    candidates = torch.cat([floats, pct, u_cos, extra, v3, items, missing[:, None]], dim=-1)
             else:
                 candidates = torch.cat([floats, pct, u_cos, extra, items, missing[:, None]], dim=-1)
         else:
@@ -187,7 +239,7 @@ class Ranker(nn.Module):
         self.variant = variant
         self.category = nn.Embedding(256, 8, padding_idx=0)
         if variant in RICH_VARIANTS:
-            in_dim = 170 if variant in V3_VARIANTS else 161
+            in_dim = 176 if variant in V4_VARIANTS else (170 if variant in V3_VARIANTS else 161)
             self.candidate = nn.Sequential(
                 nn.Linear(in_dim, width),
                 nn.LayerNorm(width),
@@ -320,10 +372,14 @@ def loader(dataset, batch_size, shuffle=False, *, prefetch=False):
 
 def scores(model, batches, device):
     model.eval()
+    use_bf16 = device == "cuda" and getattr(model, "variant", None) in V4_VARIANTS
     chunks = []
     with torch.inference_mode():
         for feeds, items, inputs, _ in batches:
-            values = model(*(tensor.to(device) for tensor in inputs)).cpu()
+            dev_inputs = tuple(tensor.to(device) for tensor in inputs)
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
+                values = model(*dev_inputs)
+            values = values.float().cpu()
             chunks.append(pl.DataFrame({"feed_id": [feed for feed, keys in zip(feeds, items, strict=True) for _ in keys],
                                         "item_id": [key for keys in items for key in keys],
                                         "score": values[~inputs[3]].numpy()},
@@ -338,10 +394,13 @@ def labels(dataset):
 def train_epoch(model, optimizer, batches, device, variant, epoch, scheduler=None):
     start = perf_counter()
     model.train()
+    use_bf16 = device == "cuda" and variant in V4_VARIANTS
     for step, (_, _, inputs, target) in enumerate(batches, start=1):
         optimizer.zero_grad(set_to_none=True)
         inputs = tuple(tensor.to(device) for tensor in inputs)
-        loss = loss_for(variant, model(*inputs), target.to(device), inputs[3])
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
+            logits = model(*inputs)
+        loss = loss_for(variant, logits.float(), target.to(device), inputs[3])
         loss.backward()
         if variant in RICH_VARIANTS:
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -362,11 +421,13 @@ def train(args):
     use_history = args.variant in HISTORY_VARIANTS
     rich = args.variant in RICH_VARIANTS
     v3 = args.variant in V3_VARIANTS
+    v4 = args.variant in V4_VARIANTS
     average_ties = args.variant in TIE_VARIANTS
     train_set = Feeds(args.data / "train", args.train_feeds, True, args.history_window, use_history,
-                      offset=args.train_offset, rich_features=rich, v3_features=v3, average_ties=average_ties)
+                      offset=args.train_offset, rich_features=rich, v3_features=v3, v4_features=v4,
+                      average_ties=average_ties)
     val_set = Feeds(args.data / "val", args.val_feeds, True, args.history_window, use_history, rich_features=rich,
-                    v3_features=v3, average_ties=average_ties)
+                    v3_features=v3, v4_features=v4, average_ties=average_ties)
     train_batches = loader(train_set, args.batch_size, shuffle=True, prefetch=args.prefetch)
     val_labels = labels(val_set)
     tune_labels, tune_batches = val_labels, loader(val_set, args.batch_size, prefetch=args.prefetch)
@@ -418,7 +479,8 @@ def oof(args):
         raise FileExistsError(args.output)
     dataset = Feeds(args.data / "train", args.train_feeds, True, args.history_window, args.variant in HISTORY_VARIANTS,
                     offset=args.train_offset, rich_features=args.variant in RICH_VARIANTS,
-                    v3_features=args.variant in V3_VARIANTS, average_ties=args.variant in TIE_VARIANTS)
+                    v3_features=args.variant in V3_VARIANTS, v4_features=args.variant in V4_VARIANTS,
+                    average_ties=args.variant in TIE_VARIANTS)
     timestamps = dataset.feeds["timestamp"].to_numpy()
     unique = np.unique(timestamps)
     if len(unique) < 3:
@@ -455,7 +517,7 @@ def predict(args):
     model.load_state_dict(checkpoint["state_dict"])
     test = Feeds(args.data / "test", 0, False, checkpoint["history_window"], variant in HISTORY_VARIANTS,
                  rich_features=variant in RICH_VARIANTS, v3_features=variant in V3_VARIANTS,
-                 average_ties=variant in TIE_VARIANTS)
+                 v4_features=variant in V4_VARIANTS, average_ties=variant in TIE_VARIANTS)
     template = pl.read_parquet(args.data / "sample_submission.parquet", columns=KEYS)
     submission = attach_scores(template, scores(model, loader(test, args.batch_size), args.device))
     args.output.parent.mkdir(parents=True, exist_ok=True)
