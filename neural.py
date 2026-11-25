@@ -2,6 +2,7 @@
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+import gc
 import json
 from pathlib import Path
 from time import perf_counter
@@ -13,6 +14,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from torch.nn.utils.rnn import pad_sequence
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 from torch.utils.data import DataLoader, Dataset, Subset
 
 from evaluation import KEYS, attach_scores, ndcg, peak_ram_mib
@@ -21,13 +23,15 @@ from ranker import BASE_FEATURES, CANDIDATE_COLUMNS, HISTORY_COLUMNS, feed_batch
 TIE_VARIANTS = ("neural-din-plus-ties", "gru-din-plus-ties")
 VARIANTS = ("transformer", "transformer-listmle", "avito-joint", "neural-din", "bst", "gru-din", "sasrec",
             "set-transformer", "neural-pairwise", "neural-din-plus", "gru-din-plus", "gru-din-v3", "gru-din-v4",
-            "gru-din-v4-listnet", *TIE_VARIANTS)
+            "gru-din-v4-listnet", "gru-din-v5", "gru-din-xl", *TIE_VARIANTS)
 HISTORY_VARIANTS = {"avito-joint", "neural-din", "bst", "gru-din", "sasrec", "neural-pairwise",
-                    "neural-din-plus", "gru-din-plus", "gru-din-v3", "gru-din-v4", "gru-din-v4-listnet", *TIE_VARIANTS}
-RICH_VARIANTS = {"neural-din-plus", "gru-din-plus", "gru-din-v3", "gru-din-v4", "gru-din-v4-listnet", *TIE_VARIANTS}
-GRU_VARIANTS = {"gru-din", "gru-din-plus", "gru-din-v3", "gru-din-v4", "gru-din-v4-listnet", "gru-din-plus-ties"}
-V3_VARIANTS = {"gru-din-v3", "gru-din-v4", "gru-din-v4-listnet"}
-V4_VARIANTS = {"gru-din-v4", "gru-din-v4-listnet"}
+                    "neural-din-plus", "gru-din-plus", "gru-din-v3", "gru-din-v4", "gru-din-v4-listnet", "gru-din-v5", "gru-din-xl", *TIE_VARIANTS}
+RICH_VARIANTS = {"neural-din-plus", "gru-din-plus", "gru-din-v3", "gru-din-v4", "gru-din-v4-listnet", "gru-din-v5", "gru-din-xl", *TIE_VARIANTS}
+GRU_VARIANTS = {"gru-din", "gru-din-plus", "gru-din-v3", "gru-din-v4", "gru-din-v4-listnet", "gru-din-v5", "gru-din-xl", "gru-din-plus-ties"}
+V3_VARIANTS = {"gru-din-v3", "gru-din-v4", "gru-din-v4-listnet", "gru-din-v5", "gru-din-xl"}
+V4_VARIANTS = {"gru-din-v4", "gru-din-v4-listnet", "gru-din-v5", "gru-din-xl"}
+V5_VARIANTS = {"gru-din-v5", "gru-din-xl"}
+XL_VARIANTS = {"gru-din-xl"}
 
 
 def id_tensor(values):
@@ -54,43 +58,68 @@ def candidate_percentiles(values, *, average_ties=False):
     return torch.empty_like(values).scatter_(0, indices, midpoints)
 
 
-def load_global_stats_for_neural():
+def load_global_stats_for_neural(include_val=False):
     stats_dir = Path(__file__).resolve().parent / "runs" / "global_stats"
-    path = stats_dir / "item_stats.parquet"
+    with_val_path = stats_dir / "item_stats_with_val.parquet"
+    if include_val and with_val_path.is_file():
+        path = with_val_path
+        meta_path = stats_dir / "meta_with_val.json"
+        print(f"Using train+val global item stats for neural: {path.name}", flush=True)
+    else:
+        path = stats_dir / "item_stats.parquet"
+        meta_path = stats_dir / "meta.json"
     if not path.is_file():
         raise FileNotFoundError(f"Global stats not found at {path}; run build_global_stats.py first")
-    meta = json.loads((stats_dir / "meta.json").read_text(encoding="utf-8"))
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
     df = pl.read_parquet(path)
+    pos_shows = df["item_pos_shows"].to_numpy() if "item_pos_shows" in df.columns else df["item_shows"].to_numpy()
     hist_col = df["item_hist_count"].to_numpy() if "item_hist_count" in df.columns else np.zeros(df.height, dtype=np.int32)
+    r_shows = df["recent_shows"].to_numpy() if "recent_shows" in df.columns else np.zeros(df.height, dtype=np.int32)
+    r_clicks = df["recent_clicks"].to_numpy() if "recent_clicks" in df.columns else np.zeros(df.height, dtype=np.int32)
+    prior = float(meta["prior"])
+    recent_prior = float(meta.get("recent_prior", prior))
+    recent_cutoff = int(meta.get("recent_cutoff", 0))
     return (
         df["item_id"].to_numpy(),
         df["item_shows"].to_numpy(),
         df["item_clicks"].to_numpy(),
         df["item_pos_sum"].to_numpy(),
+        pos_shows,
         hist_col,
-        float(meta["prior"]),
+        r_shows,
+        r_clicks,
+        prior,
+        recent_prior,
+        recent_cutoff,
     )
 
 
 class Feeds(Dataset):
     def __init__(self, split, max_feeds, labeled, window, uses_history, *, offset=0, rich_features=False,
-                 v3_features=False, v4_features=False, average_ties=False):
+                 v3_features=False, v4_features=False, v5_features=False, average_ties=False, cold_drop_prob=0.0,
+                 global_stats=None, embeddings=None):
         columns = ["feed_id", "timestamp", "user_embedding", *CANDIDATE_COLUMNS]
         if labeled:
             columns.append("target")
         if uses_history:
             columns.extend([*HISTORY_COLUMNS, "history__event_type", "history__event_source"])
         self.is_train = split.name == "train"
-        if v4_features and self.is_train:
+        if (v4_features or v5_features) and self.is_train:
             columns.append("pos")
-        self.feeds = pl.concat(list(feed_batches(split, columns, max_feeds, offset=offset)))
-        self.embeddings = open_embeddings(split)
+        batches = list(feed_batches(split, columns, max_feeds, offset=offset))
+        self.feeds = pl.concat(batches) if batches else pl.DataFrame()
+        self.embeddings = embeddings if embeddings is not None else open_embeddings(split)
         self.labeled = labeled
         self.window = window if uses_history else 0
         self.rich_features = rich_features
-        self.v3_features = v3_features or v4_features
-        self.v4_features = v4_features
-        self.global_stats = load_global_stats_for_neural() if v4_features else None
+        self.v3_features = v3_features or v4_features or v5_features
+        self.v4_features = v4_features or v5_features
+        self.v5_features = v5_features
+        self.cold_drop_prob = cold_drop_prob if self.is_train else 0.0
+        if self.v4_features:
+            self.global_stats = global_stats if global_stats is not None else load_global_stats_for_neural(include_val=(split.name == "test"))
+        else:
+            self.global_stats = None
         self.average_ties = average_ties
 
     def __len__(self):
@@ -188,7 +217,8 @@ class Feeds(Dataset):
                         if other_m.any():
                             v3[:, 8] = tail_sims[:, other_m].max(dim=1).values
                 if self.v4_features and self.global_stats is not None:
-                    g_ids, g_shows, g_clicks, g_pos_sum, g_hist, prior = self.global_stats
+                    (g_ids, g_shows, g_clicks, g_pos_sum, g_pos_shows, g_hist,
+                     g_r_shows, g_r_clicks, prior, recent_prior, recent_cutoff) = self.global_stats
                     i_arr = np.asarray(feed["item_id"], dtype=np.int32)
                     idx = np.searchsorted(g_ids, i_arr)
                     clipped = np.minimum(idx, len(g_ids) - 1)
@@ -196,23 +226,45 @@ class Feeds(Dataset):
                     shows = np.where(found, g_shows[clipped], 0).astype(np.float64)
                     clicks = np.where(found, g_clicks[clipped], 0).astype(np.float64)
                     pos_sum = np.where(found, g_pos_sum[clipped], 0).astype(np.float64)
+                    pos_shows = np.where(found, g_pos_shows[clipped], 0).astype(np.float64)
                     hist_c = np.where(found, g_hist[clipped], 0).astype(np.float64)
+                    r_shows = np.where(found, g_r_shows[clipped], 0).astype(np.float64)
+                    r_clicks = np.where(found, g_r_clicks[clipped], 0).astype(np.float64)
                     if self.is_train and self.labeled:
+                        tgt = np.asarray(feed["target"], dtype=np.float64)
                         shows = np.maximum(shows - 1.0, 0.0)
-                        clicks = np.maximum(clicks - np.asarray(feed["target"], dtype=np.float64), 0.0)
+                        clicks = np.maximum(clicks - tgt, 0.0)
                         if "pos" in feed:
                             pos_sum = np.maximum(pos_sum - np.asarray(feed["pos"], dtype=np.float64), 0.0)
+                            pos_shows = np.maximum(pos_shows - 1.0, 0.0)
+                        if recent_cutoff > 0 and feed["timestamp"] >= recent_cutoff:
+                            r_shows = np.maximum(r_shows - 1.0, 0.0)
+                            r_clicks = np.maximum(r_clicks - tgt, 0.0)
+                    if self.cold_drop_prob > 0.0 and len(i_arr):
+                        drop = np.random.random(len(i_arr)) < self.cold_drop_prob
+                        shows = np.where(drop, 0.0, shows)
+                        clicks = np.where(drop, 0.0, clicks)
+                        pos_sum = np.where(drop, 0.0, pos_sum)
+                        pos_shows = np.where(drop, 0.0, pos_shows)
+                        hist_c = np.where(drop, 0.0, hist_c)
+                        r_shows = np.where(drop, 0.0, r_shows)
+                        r_clicks = np.where(drop, 0.0, r_clicks)
                     shows_log = np.log1p(shows) / 10.0
                     ctr = (clicks + 30.0 * prior) / (shows + 30.0)
-                    mean_pos = (pos_sum + 20.0 * 40.0) / (shows + 20.0)
+                    mean_pos = (pos_sum + 20.0 * 40.0) / (pos_shows + 20.0)
                     ctr_scaled = (ctr - prior) * 20.0
                     pos_scaled = (mean_pos - 40.0) / 40.0
                     ctr_delta = ctr_scaled - ctr_scaled.mean()
                     pos_delta = pos_scaled - pos_scaled.mean()
                     hist_log = np.log1p(hist_c) / 10.0
-                    v4 = torch.from_numpy(
-                        np.stack([shows_log, ctr_scaled, pos_scaled, ctr_delta, pos_delta, hist_log], axis=1).astype(np.float32)
-                    )
+                    feats = [shows_log, ctr_scaled, pos_scaled, ctr_delta, pos_delta, hist_log]
+                    if self.v5_features:
+                        r_shows_log = np.log1p(r_shows) / 10.0
+                        r_ctr = (r_clicks + 20.0 * recent_prior) / (r_shows + 20.0)
+                        r_ctr_scaled = (r_ctr - recent_prior) * 20.0
+                        r_ctr_delta = r_ctr_scaled - r_ctr_scaled.mean()
+                        feats.extend([r_shows_log, r_ctr_scaled, r_ctr_delta])
+                    v4 = torch.from_numpy(np.stack(feats, axis=1).astype(np.float32))
                     candidates = torch.cat([floats, pct, u_cos, extra, v3, v4, items, missing[:, None]], dim=-1)
                 else:
                     candidates = torch.cat([floats, pct, u_cos, extra, v3, items, missing[:, None]], dim=-1)
@@ -236,11 +288,14 @@ def collate(rows):
 class Ranker(nn.Module):
     def __init__(self, variant, width=None):
         super().__init__()
-        width = width or (128 if variant in RICH_VARIANTS else 64)
+        is_xl = variant in XL_VARIANTS
+        width = width or (256 if is_xl else (128 if variant in RICH_VARIANTS else 64))
+        heads = 8 if width >= 256 else 4
         self.variant = variant
+        self.use_grad_checkpoint = is_xl
         self.category = nn.Embedding(256, 8, padding_idx=0)
         if variant in RICH_VARIANTS:
-            in_dim = 176 if variant in V4_VARIANTS else (170 if variant in V3_VARIANTS else 161)
+            in_dim = 179 if variant in V5_VARIANTS else (176 if variant in V4_VARIANTS else (170 if variant in V3_VARIANTS else 161))
             self.candidate = nn.Sequential(
                 nn.Linear(in_dim, width),
                 nn.LayerNorm(width),
@@ -254,12 +309,12 @@ class Ranker(nn.Module):
         self.output = nn.Linear(width, 1)
         if variant == "set-transformer":
             self.inducing = nn.Parameter(torch.randn(8, width) / width ** .5)
-            self.summarize = nn.MultiheadAttention(width, 4, batch_first=True)
-            self.recover = nn.MultiheadAttention(width, 4, batch_first=True)
+            self.summarize = nn.MultiheadAttention(width, heads, batch_first=True)
+            self.recover = nn.MultiheadAttention(width, heads, batch_first=True)
             self.set_norm = nn.LayerNorm(width)
         else:
-            layers = 3 if variant in RICH_VARIANTS else 2
-            self.encoder = nn.TransformerEncoder(self.layer(width), layers, enable_nested_tensor=False)
+            layers = 6 if is_xl else (3 if variant in RICH_VARIANTS else 2)
+            self.encoder = nn.TransformerEncoder(self.layer(width, heads), layers, enable_nested_tensor=False)
         if variant in HISTORY_VARIANTS:
             self.event_type = nn.Embedding(256, 8, padding_idx=0)
             self.event_source = nn.Embedding(256, 8, padding_idx=0)
@@ -267,17 +322,19 @@ class Ranker(nn.Module):
             self.history = nn.Linear(153, width)
             self.empty_history = nn.Parameter(torch.zeros(1, 1, width))
         if variant in HISTORY_VARIANTS - {"avito-joint", "sasrec"}:
-            self.history_attention = nn.MultiheadAttention(width, 4, batch_first=True)
+            self.history_attention = nn.MultiheadAttention(width, heads, batch_first=True)
         if variant in HISTORY_VARIANTS - {"avito-joint"}:
             self.history_norm = nn.LayerNorm(width)
         if variant in {"bst", "sasrec"}:
-            self.history_encoder = nn.TransformerEncoder(self.layer(width), 1, enable_nested_tensor=False)
+            self.history_encoder = nn.TransformerEncoder(self.layer(width, heads), 1, enable_nested_tensor=False)
         if variant in GRU_VARIANTS:
-            self.history_encoder = nn.GRU(width, width, batch_first=True)
+            gru_layers = 2 if is_xl else 1
+            self.history_encoder = nn.GRU(width, width, num_layers=gru_layers,
+                                          dropout=0.1 if gru_layers > 1 else 0.0, batch_first=True)
 
     @staticmethod
-    def layer(width):
-        return nn.TransformerEncoderLayer(width, 4, width * 2, dropout=.1, batch_first=True, norm_first=True)
+    def layer(width, heads=4):
+        return nn.TransformerEncoderLayer(width, heads, width * 2, dropout=.1, batch_first=True, norm_first=True)
 
     def history_tokens(self, history, events, padding):
         inputs = torch.cat([history, self.category(events[..., 0]), self.event_type(events[..., 1]),
@@ -323,7 +380,13 @@ class Ranker(nn.Module):
             refined, _ = self.recover(tokens, context, context, need_weights=False)
             tokens = self.set_norm(tokens + refined)
         else:
-            tokens = self.encoder(tokens, src_key_padding_mask=mask)
+            if self.use_grad_checkpoint and self.training:
+                for layer in self.encoder.layers:
+                    tokens = grad_checkpoint(layer, tokens, None, mask, use_reentrant=False)
+                if self.encoder.norm is not None:
+                    tokens = self.encoder.norm(tokens)
+            else:
+                tokens = self.encoder(tokens, src_key_padding_mask=mask)
         return self.output(tokens[:, 1:]).squeeze(-1)
 
 
@@ -401,27 +464,40 @@ def labels(dataset):
     return dataset.feeds.select(*KEYS, "target").explode("item_id", "target")
 
 
-def train_epoch(model, optimizer, batches, device, variant, epoch, scheduler=None):
+def train_epoch(model, optimizer, batches, device, variant, epoch, scheduler=None, accum_steps=1, label=None):
     start = perf_counter()
     model.train()
     use_bf16 = device == "cuda" and variant in V4_VARIANTS
+    tag = label or f"epoch={epoch}"
+    optimizer.zero_grad(set_to_none=True)
+    total_batches = len(batches)
     for step, (_, _, inputs, target) in enumerate(batches, start=1):
-        optimizer.zero_grad(set_to_none=True)
         inputs = tuple(tensor.to(device) for tensor in inputs)
         with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
             logits = model(*inputs)
         loss = loss_for(variant, logits.float(), target.to(device), inputs[3])
-        loss.backward()
-        if variant in RICH_VARIANTS:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
-        if scheduler is not None:
-            scheduler.step()
-        if step == 1 or step == len(batches) or step % 100 == 0:
-            print(f"{variant} epoch={epoch} batch={step}/{len(batches)} loss={loss.detach().item():.6f}", flush=True)
+        (loss / accum_steps).backward()
+        if step % accum_steps == 0 or step == total_batches:
+            if variant in RICH_VARIANTS:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            if scheduler is not None:
+                scheduler.step()
+        if step == 1 or step == total_batches or step % 200 == 0:
+            print(f"{variant} {tag} batch={step}/{total_batches} loss={loss.detach().item():.6f}", flush=True)
     seconds = round(perf_counter() - start, 2)
-    print(f"{variant} epoch={epoch} training_seconds={seconds:.2f}", flush=True)
+    print(f"{variant} {tag} training_seconds={seconds:.2f}", flush=True)
     return seconds
+
+
+def _save_checkpoint(path, state_dict, variant, history_window):
+    tmp = path.with_name(f".{path.name}.{uuid4().hex}")
+    try:
+        torch.save({"state_dict": state_dict, "variant": variant, "history_window": history_window}, tmp)
+        tmp.replace(path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def train(args):
@@ -432,13 +508,19 @@ def train(args):
     rich = args.variant in RICH_VARIANTS
     v3 = args.variant in V3_VARIANTS
     v4 = args.variant in V4_VARIANTS
+    v5 = args.variant in V5_VARIANTS
+    is_xl = args.variant in XL_VARIANTS
     average_ties = args.variant in TIE_VARIANTS
-    train_set = Feeds(args.data / "train", args.train_feeds, True, args.history_window, use_history,
-                      offset=args.train_offset, rich_features=rich, v3_features=v3, v4_features=v4,
-                      average_ties=average_ties)
+    cold_drop = args.cold_drop if args.cold_drop is not None else (0.35 if v5 else 0.0)
+    accum_steps = args.accum_steps or (4 if is_xl else 1)
+    lr = args.lr or (6e-4 if is_xl else 1e-3)
+    chunk_feeds = args.chunk_feeds
+    if cold_drop > 0:
+        print(f"Cold-item global stats dropout enabled for neural: p={cold_drop:.2f}", flush=True)
+    shared_stats = load_global_stats_for_neural(include_val=False) if (v4 or v5) else None
     val_set = Feeds(args.data / "val", args.val_feeds, True, args.history_window, use_history, rich_features=rich,
-                    v3_features=v3, v4_features=v4, average_ties=average_ties)
-    train_batches = loader(train_set, args.batch_size, shuffle=True, prefetch=args.prefetch)
+                    v3_features=v3, v4_features=v4, v5_features=v5, average_ties=average_ties,
+                    global_stats=shared_stats)
     val_labels = labels(val_set)
     tune_labels, tune_batches = val_labels, loader(val_set, args.batch_size, prefetch=args.prefetch)
     if args.tune_before is not None:
@@ -447,19 +529,59 @@ def train(args):
             raise ValueError("--tune-before must divide the selected validation feeds into two nonempty sets")
         tune_labels = val_labels.filter(pl.col("feed_id").is_in(val_set.feeds["feed_id"][indices]))
         tune_batches = loader(Subset(val_set, indices.tolist()), args.batch_size, prefetch=args.prefetch)
+
     model = Ranker(args.variant).to(args.device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.0001)
-    scheduler = (torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, len(train_batches) * args.epochs), eta_min=1e-5)
-                 if rich else None)
-    best, best_epoch, best_state, curve = -1, 0, None, []
+    if args.resume_from is not None:
+        ckpt = torch.load(args.resume_from, map_location="cpu", weights_only=True)
+        model.load_state_dict(ckpt["state_dict"])
+        print(f"Resumed weights from {args.resume_from}", flush=True)
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"Model {args.variant}: params={n_params:,}, lr={lr}, batch_size={args.batch_size}, accum_steps={accum_steps}, chunk_feeds={chunk_feeds}", flush=True)
+
+    streaming = chunk_feeds > 0 and (args.train_feeds == 0 or chunk_feeds < args.train_feeds)
+    if streaming:
+        total_target_feeds = args.train_feeds if args.train_feeds > 0 else 3_151_208
+        est_batches_per_epoch = max(1, (total_target_feeds + args.batch_size - 1) // args.batch_size)
+        est_opt_steps = max(1, (est_batches_per_epoch // accum_steps) * args.epochs)
+    else:
+        train_set = Feeds(args.data / "train", args.train_feeds, True, args.history_window, use_history,
+                          offset=args.train_offset, rich_features=rich, v3_features=v3, v4_features=v4,
+                          v5_features=v5, average_ties=average_ties, cold_drop_prob=cold_drop,
+                          global_stats=shared_stats)
+        train_batches = loader(train_set, args.batch_size, shuffle=True, prefetch=args.prefetch)
+        total_target_feeds = len(train_set)
+        est_opt_steps = max(1, ((len(train_batches) + accum_steps - 1) // accum_steps) * args.epochs)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.0001)
+    if rich:
+        warmup = min(500, max(1, est_opt_steps // 10)) if is_xl else 0
+        if warmup > 0:
+            def lr_lambda(step):
+                if step < warmup:
+                    return float(step + 1) / float(warmup)
+                prog = min(1.0, float(step - warmup) / float(max(1, est_opt_steps - warmup)))
+                return 0.02 + 0.98 * 0.5 * (1.0 + np.cos(np.pi * prog))
+            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        else:
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=est_opt_steps, eta_min=1e-5)
+    else:
+        scheduler = None
+
+    best, best_step, best_state, curve = -1.0, 0, None, []
     epoch_seconds = []
     tuning_slates = None
     if args.device == "cuda":
         from ensemble import Slates
 
         tuning_slates = Slates(tune_labels, args.device)
-    for epoch in range(1, args.epochs + 1):
-        epoch_seconds.append(train_epoch(model, optimizer, train_batches, args.device, args.variant, epoch, scheduler))
+
+    args.output.mkdir(parents=True, exist_ok=True)
+    eval_step = 0
+    seen_feeds_per_epoch = 0
+
+    def evaluate_and_checkpoint(step_tag):
+        nonlocal best, best_step, best_state, eval_step
+        eval_step += 1
         predicted = scores(model, tune_batches, args.device)
         if tuning_slates is None:
             metric = ndcg(attach_scores(tune_labels, predicted))["ndcg"]
@@ -467,21 +589,66 @@ def train(args):
             aligned = attach_scores(tuning_slates.frame, predicted).sort(["feed_id", "target", "item_id"])
             values = torch.as_tensor(aligned["score"].to_numpy()[tuning_slates.rows], device=args.device)
             metric = tuning_slates.metric(values)
-        curve.append([epoch, metric])
-        print(f"{args.variant} epoch={epoch} tuning_ndcg={metric:.6f}", flush=True)
+        curve.append([eval_step, metric])
+        print(f"{args.variant} {step_tag} tuning_ndcg={metric:.6f} (best={max(best, metric):.6f})", flush=True)
         if metric > best:
-            best, best_epoch = metric, epoch
+            best, best_step = metric, eval_step
             best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+            _save_checkpoint(args.output / "model.pt", best_state, args.variant, args.history_window)
+
+    if streaming:
+        train_embeddings = open_embeddings(args.data / "train")
+        for epoch in range(1, args.epochs + 1):
+            seen_this_epoch = 0
+            chunk_idx = 0
+            while args.train_feeds == 0 or seen_this_epoch < args.train_feeds:
+                cur_limit = chunk_feeds if args.train_feeds == 0 else min(chunk_feeds, args.train_feeds - seen_this_epoch)
+                cur_offset = args.train_offset + seen_this_epoch
+                print(f"{args.variant} epoch={epoch} loading chunk={chunk_idx + 1} (offset={cur_offset:,}, limit={cur_limit:,})...", flush=True)
+                chunk_set = Feeds(args.data / "train", cur_limit, True, args.history_window, use_history,
+                                  offset=cur_offset, rich_features=rich, v3_features=v3, v4_features=v4,
+                                  v5_features=v5, average_ties=average_ties, cold_drop_prob=cold_drop,
+                                  global_stats=shared_stats, embeddings=train_embeddings)
+                if len(chunk_set) == 0:
+                    del chunk_set
+                    break
+                chunk_idx += 1
+                seen_this_epoch += len(chunk_set)
+                tag = f"epoch={epoch} chunk={chunk_idx} ({seen_this_epoch:,} feeds)"
+                chunk_batches = loader(chunk_set, args.batch_size, shuffle=True, prefetch=args.prefetch)
+                epoch_seconds.append(train_epoch(model, optimizer, chunk_batches, args.device, args.variant,
+                                                 epoch, scheduler, accum_steps=accum_steps, label=tag))
+                del chunk_batches, chunk_set
+                gc.collect()
+                evaluate_and_checkpoint(tag)
+            seen_feeds_per_epoch = seen_this_epoch
+    else:
+        seen_feeds_per_epoch = len(train_set)
+        for epoch in range(1, args.epochs + 1):
+            epoch_seconds.append(train_epoch(model, optimizer, train_batches, args.device, args.variant,
+                                             epoch, scheduler, accum_steps=accum_steps))
+            evaluate_and_checkpoint(f"epoch={epoch}")
+
     model.load_state_dict(best_state)
     predictions = scores(model, loader(val_set, args.batch_size, prefetch=args.prefetch), args.device)
     report = {f"val_{name}": value for name, value in ndcg(attach_scores(val_labels, predictions)).items()}
-    report.update(variant=args.variant, best_epoch=best_epoch, tune_before=args.tune_before, tuning_curve=curve,
-                  train_feeds=len(train_set), val_feeds=len(val_set),
+    report.update(variant=args.variant, best_epoch=best_step, tune_before=args.tune_before, tuning_curve=curve,
+                  train_feeds=seen_feeds_per_epoch, val_feeds=len(val_set),
+                  chunk_feeds=chunk_feeds, accum_steps=accum_steps, lr=lr, cold_drop=cold_drop,
                   epoch_seconds=epoch_seconds, peak_ram_mib=peak_ram_mib())
-    args.output.mkdir(parents=True)
-    torch.save({"state_dict": best_state, "variant": args.variant, "history_window": args.history_window}, args.output / "model.pt")
+    _save_checkpoint(args.output / "model.pt", best_state, args.variant, args.history_window)
     predictions.write_parquet(args.output / "val_predictions.parquet")
     (args.output / "metrics.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    print(f"Finished {args.variant}: full_val_ndcg={report['val_ndcg']:.6f} (best_step={best_step})", flush=True)
+    if args.tune_before is None and seen_feeds_per_epoch >= 10_000 and not args.output.name.startswith("_"):
+        try:
+            import notify_tg
+            msg = (f"✅ {args.variant} finished ({args.output.name})\n"
+                   f"val_ndcg: {report['val_ndcg']:.6f}\n"
+                   f"feeds: {seen_feeds_per_epoch:,} x {args.epochs}ep, best_step={best_step}")
+            notify_tg.send(msg)
+        except Exception:
+            pass
 
 
 def oof(args):
@@ -490,7 +657,7 @@ def oof(args):
     dataset = Feeds(args.data / "train", args.train_feeds, True, args.history_window, args.variant in HISTORY_VARIANTS,
                     offset=args.train_offset, rich_features=args.variant in RICH_VARIANTS,
                     v3_features=args.variant in V3_VARIANTS, v4_features=args.variant in V4_VARIANTS,
-                    average_ties=args.variant in TIE_VARIANTS)
+                    v5_features=args.variant in V5_VARIANTS, average_ties=args.variant in TIE_VARIANTS)
     timestamps = dataset.feeds["timestamp"].to_numpy()
     unique = np.unique(timestamps)
     if len(unique) < 3:
@@ -527,7 +694,8 @@ def predict(args):
     model.load_state_dict(checkpoint["state_dict"])
     test = Feeds(args.data / "test", 0, False, checkpoint["history_window"], variant in HISTORY_VARIANTS,
                  rich_features=variant in RICH_VARIANTS, v3_features=variant in V3_VARIANTS,
-                 v4_features=variant in V4_VARIANTS, average_ties=variant in TIE_VARIANTS)
+                 v4_features=variant in V4_VARIANTS, v5_features=variant in V5_VARIANTS,
+                 average_ties=variant in TIE_VARIANTS)
     template = pl.read_parquet(args.data / "sample_submission.parquet", columns=KEYS)
     submission = attach_scores(template, scores(model, loader(test, args.batch_size), args.device))
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -545,6 +713,11 @@ def main():
     training.add_argument("--val-feeds", type=int, default=0)
     training.add_argument("--history-window", type=int, default=32)
     training.add_argument("--tune-before", type=int)
+    training.add_argument("--cold-drop", type=float, default=None, help="Drop global stats on train items with prob p (default 0.35 for gru-din-v5/xl)")
+    training.add_argument("--chunk-feeds", type=int, default=0, help="Stream train in chunks of N feeds to stay within RAM")
+    training.add_argument("--accum-steps", type=int, default=0, help="Gradient accumulation steps (default 4 for gru-din-xl, 1 otherwise)")
+    training.add_argument("--lr", type=float, default=0.0, help="Override peak learning rate (default 6e-4 for xl, 1e-3 otherwise)")
+    training.add_argument("--resume-from", type=Path, default=None, help="Initialize weights from an existing model.pt")
     training.add_argument("--prefetch", action="store_true", help="Prepare one CPU batch ahead")
     training.set_defaults(run=train)
     oof_command = commands.add_parser("oof")
@@ -582,7 +755,18 @@ def main():
         if not torch.cuda.is_available():
             parser.error("CUDA PyTorch is required for --device cuda")
         torch.set_float32_matmul_precision("high")
-    args.run(args)
+    try:
+        args.run(args)
+    except Exception as exc:
+        if (args.run is train and getattr(args, "tune_before", None) is None
+                and (args.train_feeds == 0 or args.train_feeds >= 10_000)
+                and not args.output.name.startswith("_")):
+            try:
+                import notify_tg
+                notify_tg.send(f"❌ {args.variant} failed ({args.output.name}): {type(exc).__name__}: {exc}")
+            except Exception:
+                pass
+        raise
 
 
 if __name__ == "__main__":

@@ -40,6 +40,9 @@ GLOBAL_STATS_FEATURES = [
     "global_item_shows_log", "global_item_ctr", "global_item_mean_pos",
     "global_item_ctr_delta", "global_item_pos_delta",
 ]
+RECENT_GLOBAL_FEATURES = [
+    "global_recent_shows_log", "global_recent_ctr", "global_recent_ctr_delta",
+]
 V4_EXTRA_FEATURES = [
     "global_item_hist_log", "global_item_hist_delta", "global_user_feeds_log", "global_user_ctr",
     "cat_din_max_cosine", "f5_x_din_decay", "f5z_x_din_decay", "f1_zscore", "f2_zscore", "f4_zscore",
@@ -76,6 +79,7 @@ VARIANTS = {
     "din-events-v2": [*FEATURES, *DIN_FEATURES, *EVENT_DIN_FEATURES, *FEED_CONTEXT_FEATURES],
     "din-events-v3": [*FEATURES, *DIN_FEATURES, *EVENT_DIN_FEATURES, *FEED_CONTEXT_FEATURES, *GLOBAL_STATS_FEATURES],
     "din-events-v3-qsm": [*FEATURES, *DIN_FEATURES, *EVENT_DIN_FEATURES, *FEED_CONTEXT_FEATURES, *GLOBAL_STATS_FEATURES],
+    "din-events-v3-robust": [*FEATURES, *DIN_FEATURES, *EVENT_DIN_FEATURES, *FEED_CONTEXT_FEATURES, *GLOBAL_STATS_FEATURES, *RECENT_GLOBAL_FEATURES],
     "din-events-v4-qsm": [*FEATURES, *DIN_FEATURES, *EVENT_DIN_FEATURES, *FEED_CONTEXT_FEATURES, *GLOBAL_STATS_FEATURES, *V4_EXTRA_FEATURES],
 }
 VARIANTS["din-events-v2-ties"] = [
@@ -288,33 +292,52 @@ def vector_features(feed, embeddings, feature_names, reference, clusters=None):
     return result
 
 
-def load_global_item_stats():
+def load_global_item_stats(include_val=False):
     stats_dir = Path(__file__).resolve().parent / "runs" / "global_stats"
-    path = stats_dir / "item_stats.parquet"
+    with_val_path = stats_dir / "item_stats_with_val.parquet"
+    if include_val and with_val_path.is_file():
+        path = with_val_path
+        meta_path = stats_dir / "meta_with_val.json"
+        print(f"Using train+val global item stats: {path.name}", flush=True)
+    else:
+        path = stats_dir / "item_stats.parquet"
+        meta_path = stats_dir / "meta.json"
     if not path.is_file():
         raise FileNotFoundError(f"Global stats not found at {path}; run build_global_stats.py first")
-    meta = json.loads((stats_dir / "meta.json").read_text(encoding="utf-8"))
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
     df = pl.read_parquet(path)
+    pos_shows = df["item_pos_shows"].to_numpy() if "item_pos_shows" in df.columns else df["item_shows"].to_numpy()
     hist_col = df["item_hist_count"].to_numpy() if "item_hist_count" in df.columns else np.zeros(df.height, dtype=np.int32)
+    r_shows = df["recent_shows"].to_numpy() if "recent_shows" in df.columns else np.zeros(df.height, dtype=np.int32)
+    r_clicks = df["recent_clicks"].to_numpy() if "recent_clicks" in df.columns else np.zeros(df.height, dtype=np.int32)
     u_path = stats_dir / "user_stats.parquet"
     if u_path.is_file():
         udf = pl.read_parquet(u_path)
         u_tuple = (udf["user_id"].to_numpy(), udf["user_feeds"].to_numpy(), udf["user_shows"].to_numpy(), udf["user_clicks"].to_numpy())
     else:
         u_tuple = None
+    prior = float(meta["prior"])
+    recent_prior = float(meta.get("recent_prior", prior))
+    recent_cutoff = int(meta.get("recent_cutoff", 0))
     return (
         df["item_id"].to_numpy(),
         df["item_shows"].to_numpy(),
         df["item_clicks"].to_numpy(),
         df["item_pos_sum"].to_numpy(),
+        pos_shows,
         hist_col,
+        r_shows,
+        r_clicks,
         u_tuple,
-        float(meta["prior"]),
+        prior,
+        recent_prior,
+        recent_cutoff,
     )
 
 
-def apply_global_item_stats(candidates, global_stats, is_train, features):
-    g_ids, g_shows, g_clicks, g_pos_sum, g_hist, u_tuple, prior = global_stats
+def apply_global_item_stats(candidates, global_stats, is_train, features, cold_drop_prob=0.0):
+    (g_ids, g_shows, g_clicks, g_pos_sum, g_pos_shows, g_hist,
+     g_r_shows, g_r_clicks, u_tuple, prior, recent_prior, recent_cutoff) = global_stats
     item_ids = candidates["item_id"].to_numpy()
     idx = np.searchsorted(g_ids, item_ids)
     clipped = np.minimum(idx, len(g_ids) - 1)
@@ -322,20 +345,46 @@ def apply_global_item_stats(candidates, global_stats, is_train, features):
     shows = np.where(found, g_shows[clipped], 0).astype(np.float64)
     clicks = np.where(found, g_clicks[clipped], 0).astype(np.float64)
     pos_sum = np.where(found, g_pos_sum[clipped], 0).astype(np.float64)
+    pos_shows = np.where(found, g_pos_shows[clipped], 0).astype(np.float64)
     hist_c = np.where(found, g_hist[clipped], 0).astype(np.float64)
+    r_shows = np.where(found, g_r_shows[clipped], 0).astype(np.float64)
+    r_clicks = np.where(found, g_r_clicks[clipped], 0).astype(np.float64)
     if is_train and "target" in candidates.columns:
+        tgt = candidates["target"].to_numpy().astype(np.float64)
         shows = np.maximum(shows - 1.0, 0.0)
-        clicks = np.maximum(clicks - candidates["target"].to_numpy().astype(np.float64), 0.0)
+        clicks = np.maximum(clicks - tgt, 0.0)
         if "pos" in candidates.columns:
             pos_sum = np.maximum(pos_sum - candidates["pos"].to_numpy().astype(np.float64), 0.0)
+            pos_shows = np.maximum(pos_shows - 1.0, 0.0)
+        if "timestamp" in candidates.columns and recent_cutoff > 0:
+            is_rec = candidates["timestamp"].to_numpy() >= recent_cutoff
+            r_shows = np.where(is_rec, np.maximum(r_shows - 1.0, 0.0), r_shows)
+            r_clicks = np.where(is_rec, np.maximum(r_clicks - tgt, 0.0), r_clicks)
+    if is_train and cold_drop_prob > 0.0 and len(item_ids):
+        seed = (int(item_ids[0]) * 1000003 + len(item_ids) * 97 + 42) & 0xFFFFFFFF
+        drop = np.random.default_rng(seed).random(len(item_ids)) < cold_drop_prob
+        shows = np.where(drop, 0.0, shows)
+        clicks = np.where(drop, 0.0, clicks)
+        pos_sum = np.where(drop, 0.0, pos_sum)
+        pos_shows = np.where(drop, 0.0, pos_shows)
+        hist_c = np.where(drop, 0.0, hist_c)
+        r_shows = np.where(drop, 0.0, r_shows)
+        r_clicks = np.where(drop, 0.0, r_clicks)
     shows_log = np.log1p(shows).astype(np.float32)
     ctr = ((clicks + 30.0 * prior) / (shows + 30.0)).astype(np.float32)
-    mean_pos = ((pos_sum + 20.0 * 40.0) / (shows + 20.0)).astype(np.float32)
+    mean_pos = ((pos_sum + 20.0 * 40.0) / (pos_shows + 20.0)).astype(np.float32)
     cols = [
         pl.Series("global_item_shows_log", shows_log, dtype=pl.Float32),
         pl.Series("global_item_ctr", ctr, dtype=pl.Float32),
         pl.Series("global_item_mean_pos", mean_pos, dtype=pl.Float32),
     ]
+    if "global_recent_shows_log" in features:
+        r_shows_log = np.log1p(r_shows).astype(np.float32)
+        r_ctr = ((r_clicks + 20.0 * recent_prior) / (r_shows + 20.0)).astype(np.float32)
+        cols.extend([
+            pl.Series("global_recent_shows_log", r_shows_log, dtype=pl.Float32),
+            pl.Series("global_recent_ctr", r_ctr, dtype=pl.Float32),
+        ])
     if "global_item_hist_log" in features:
         cols.append(pl.Series("global_item_hist_log", np.log1p(hist_c).astype(np.float32), dtype=pl.Float32))
     if "global_user_ctr" in features and u_tuple is not None and "user_id" in candidates.columns:
@@ -359,20 +408,25 @@ def apply_global_item_stats(candidates, global_stats, is_train, features):
         (pl.col("global_item_ctr") - pl.col("global_item_ctr").mean().over("feed_id")).cast(pl.Float32).alias("global_item_ctr_delta"),
         (pl.col("global_item_mean_pos") - pl.col("global_item_mean_pos").mean().over("feed_id")).cast(pl.Float32).alias("global_item_pos_delta"),
     ]
+    if "global_recent_ctr_delta" in features:
+        delta_cols.append((pl.col("global_recent_ctr") - pl.col("global_recent_ctr").mean().over("feed_id")).cast(pl.Float32).alias("global_recent_ctr_delta"))
     if "global_item_hist_delta" in features:
         delta_cols.append((pl.col("global_item_hist_log") - pl.col("global_item_hist_log").mean().over("feed_id")).cast(pl.Float32).alias("global_item_hist_delta"))
     return candidates.with_columns(cols).with_columns(delta_cols)
 
 
-def expand_batch(feeds, embeddings, labeled, features, reference, clusters=None, global_stats=None, is_train=False):
+def expand_batch(feeds, embeddings, labeled, features, reference, clusters=None, global_stats=None, is_train=False, cold_drop_prob=0.0):
     per_feed = [vector_features(feed, embeddings, features, reference, clusters) for feed in feeds.iter_rows(named=True)]
     has_pos = "pos" in feeds.columns
     need_user = "global_user_ctr" in features and "user_id" in feeds.columns
+    has_ts = "timestamp" in feeds.columns and is_train and global_stats is not None
     arrays = [*CANDIDATE_COLUMNS, *(["target"] if labeled else []), *(["pos"] if has_pos else [])]
-    select_cols = ["feed_id", *(["user_id"] if need_user else []), *arrays]
+    select_cols = ["feed_id", *(["user_id"] if need_user else []), *(["timestamp"] if has_ts else []), *arrays]
     candidates = feeds.select(*select_cols).explode(arrays).drop("item_id__embedding_idx")
     if global_stats is not None:
-        candidates = apply_global_item_stats(candidates, global_stats, is_train, features)
+        candidates = apply_global_item_stats(candidates, global_stats, is_train, features, cold_drop_prob=cold_drop_prob)
+    if has_ts:
+        candidates = candidates.drop("timestamp")
     if need_user:
         candidates = candidates.drop("user_id")
     if "pos_bias" in features:
@@ -490,7 +544,7 @@ def parallel_candidates(split, batches, labeled, features, workers):
 
 def candidate_batches(split, *, features=FEATURES, labeled=False, max_feeds=0,
                       reference=None, after=None, before=None, centers=None, device="cpu", offset=0,
-                      feature_workers=1):
+                      feature_workers=1, cold_drop_prob=0.0):
     columns = ["feed_id", "user_embedding", *CANDIDATE_COLUMNS]
     if "history_length" in features:
         columns.extend(HISTORY_COLUMNS)
@@ -505,7 +559,7 @@ def candidate_batches(split, *, features=FEATURES, labeled=False, max_feeds=0,
         columns.append("user_id")
     if labeled:
         columns.append("target")
-    if after is not None or before is not None:
+    if after is not None or before is not None or (need_global and split.name == "train" and "global_recent_shows_log" in features):
         columns.append("timestamp")
     def selected_batches():
         for batch in feed_batches(split, columns, max_feeds, offset=offset):
@@ -523,7 +577,7 @@ def candidate_batches(split, *, features=FEATURES, labeled=False, max_feeds=0,
         return
 
     embeddings = open_embeddings(split)
-    global_stats = load_global_item_stats() if need_global else None
+    global_stats = load_global_item_stats(include_val=(split.name == "test")) if need_global else None
     is_train = split.name == "train"
     clusters = None
     if centers is not None:
@@ -534,8 +588,15 @@ def candidate_batches(split, *, features=FEATURES, labeled=False, max_feeds=0,
             batch[key].explode().unique().to_numpy() for batch in batches for key in (candidate_key, history_key)
         ]))
         clusters = embedding_clusters.assign(embeddings, centers, device, indices[indices >= 0].astype(np.intp))
+    processed_feeds = 0
+    next_report = 25_000
     for batch in selected_batches():
-        yield expand_batch(batch, embeddings, labeled, features, reference, clusters, global_stats, is_train)
+        yield expand_batch(batch, embeddings, labeled, features, reference, clusters, global_stats, is_train,
+                           cold_drop_prob=cold_drop_prob if is_train else 0.0)
+        processed_feeds += batch.height
+        if processed_feeds >= next_report:
+            print(f"  prepared {processed_feeds:,} feeds ({split.name})...", flush=True)
+            next_report += 25_000
 
 
 def read_candidates(split, **kwargs):
@@ -554,9 +615,13 @@ def load_training(args, features, centers=None):
     split = args.data / "train"
     kind = behavior.reference_kind(features)
     selection = {"max_feeds": args.train_feeds, "offset": args.train_offset}
+    cold_drop = args.cold_drop if args.cold_drop is not None else (0.35 if args.variant == "din-events-v3-robust" else 0.0)
+    if cold_drop > 0:
+        print(f"Cold-item global stats dropout enabled: p={cold_drop:.2f}", flush=True)
     if kind is None:
         return read_candidates(split, features=features, labeled=True, centers=centers,
-                               device=args.device, feature_workers=args.feature_workers, **selection), None
+                               device=args.device, feature_workers=args.feature_workers,
+                               cold_drop_prob=cold_drop, **selection), None
     if args.feature_workers > 1:
         raise ValueError("Parallel feature workers require a ranker without a fitted behavior reference")
 
@@ -588,11 +653,11 @@ def train_centers(args):
 def new_model(args, iterations):
     if args.variant == "lambda":
         loss = "LambdaMart:metric=NDCG"
-    elif args.variant in {"din-events-v3-qsm", "din-events-v4-qsm"}:
+    elif args.variant in {"din-events-v3-qsm", "din-events-v3-robust", "din-events-v4-qsm"}:
         loss = "QuerySoftMax"
     else:
         loss = "YetiRank"
-    depth = 7 if args.variant in {"din-events-v3-qsm", "din-events-v4-qsm"} else 6
+    depth = 7 if args.variant in {"din-events-v3-qsm", "din-events-v3-robust", "din-events-v4-qsm"} else 6
     return CatBoostRanker(
         loss_function=loss,
         eval_metric="RMSE" if args.device == "gpu" else NDCG,
@@ -626,7 +691,7 @@ def select_gpu_checkpoint(model, tuning, val_pool, args):
 
     metric = gpu_ndcg_evaluator(tuning)
     step = max(1, args.iterations // 20)
-    if args.variant not in {"din-events-v2", "din-events-v2-ties"}:
+    if args.variant not in {"din-events-v2", "din-events-v2-ties", "din-events-v3-qsm", "din-events-v3-robust", "din-events-v4-qsm"}:
         step = min(5, step)
     checkpoints = sorted({1, model.tree_count_, *range(step, model.tree_count_, step)})
     full_prediction = try_gpu_scores(model, val_pool, args.threads)
@@ -757,7 +822,7 @@ def train(args):
     report["peak_private_mib"] = peak_ram_mib(private=True)
     (args.output / "metrics.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(json.dumps({key: value for key, value in report.items() if key != "tuning_curve"}, indent=2))
-    if args.tune_before is None:
+    if args.tune_before is None and train_feeds >= 10_000 and not args.output.name.startswith("_"):
         try:
             import notify_tg
             notify_tg.send(notify_tg.format_ranker(args.output, report))
@@ -805,6 +870,7 @@ def main():
     training.add_argument("--val-feeds", type=int, default=10_000, help="0 uses the full val split")
     training.add_argument("--iterations", type=int, default=500)
     training.add_argument("--variant", choices=VARIANTS, default="history")
+    training.add_argument("--cold-drop", type=float, default=None, help="Drop global stats on train items with prob p (default 0.35 for din-events-v3-robust)")
     training.add_argument("--tune-before", type=int, help="Use only validation feeds strictly before this Unix time for early stopping")
     training.add_argument("--stack-train", nargs=2, type=Path, metavar=("JOINT", "GRU"))
     training.add_argument("--stack-val", nargs=2, type=Path, metavar=("JOINT", "GRU"))
