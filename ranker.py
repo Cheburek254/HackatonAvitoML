@@ -569,7 +569,7 @@ def train(args):
     report["peak_private_mib"] = peak_ram_mib(private=True)
     (args.output / "metrics.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(json.dumps({key: value for key, value in report.items() if key != "tuning_curve"}, indent=2))
-    if args.tune_before is None and os.environ.get("AVITO_NOTIFY_TELEGRAM") == "1":
+    if args.tune_before is None:
         try:
             import notify_tg
             notify_tg.send(notify_tg.format_ranker(args.output, report))

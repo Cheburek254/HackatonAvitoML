@@ -18,7 +18,7 @@ from evaluation import KEYS, attach_scores, blend, ndcg
 from ranker import STACK_VARIANTS, VARIANTS, feed_batches
 
 NEURAL = ("transformer", "transformer-listmle", "avito-joint", "neural-din", "bst", "gru-din", "sasrec",
-          "set-transformer", "neural-pairwise", "neural-din-plus", "gru-din-plus")
+          "set-transformer", "neural-pairwise", "neural-din-plus", "gru-din-plus", "gru-din-v3")
 OFFICIAL = ("avito-catboost", "avito-transformer")
 CUDA_NEURAL = ("dual-history",)
 TREE_MODELS = tuple(name for name in VARIANTS if name not in STACK_VARIANTS)
@@ -351,9 +351,11 @@ def run_benchmark(args, labels, cutoff, tune_ids, metric, selected):
     print("Model                  holdout NDCG    full val NDCG")
     for result in report["models"]:
         print(f"{result['model']:<22} {result['holdout']['ndcg']:>12.6f} {result['val']['ndcg']:>15.6f}")
-    if os.environ.get("AVITO_NOTIFY_TELEGRAM") == "1":
+    try:
         import notify_tg
         notify_tg.send(notify_tg.format_benchmark(report_path))
+    except Exception:
+        pass
 
 
 def diagnose(args):
