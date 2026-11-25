@@ -68,6 +68,19 @@ python -m venv .venv
 
 Для каждого способа скрипт перебирает вес правой модели от 0 до 1 с шагом 0,1 на ранней половине `val`. RRF использует ранги внутри ленты и константу 60. Z-бленд стандартизирует оценки каждой модели внутри ленты. В новой папке результата сохраняются предсказания обеих смесей и `report.json` с весами, полной NDCG на каждом временном срезе и парными 95%-ми интервалами разницы NDCG по пользователям поздней валидации.
 
+### LightGBM и Z-бленд с сохранёнными прогнозами CatBoost и GRU
+
+LightGBM LambdaRank работает на CPU. Пример использует признаки `din-events-v2` и первые 200 000 лент. Выбор числа деревьев идёт по NDCG на ранней `val` с отсечением на длине её самой длинной ленты. Для итогового сравнения `lightgbm_blend.py` считает полную NDCG и использует CUDA при указании `--gpu`.
+
+```powershell
+$data = 'C:/study/AvitoData/competition'
+$run = 'runs/avito-real/lightgbm-200k-blend'
+.\.venv\Scripts\python.exe lgbm_ranker.py train --data $data --output "$run/lightgbm" --train-feeds 200000 --iterations 600 --threads 8
+.\.venv\Scripts\python.exe lightgbm_blend.py --data $data --catboost runs/avito-real/din-events-v2-third-600/merged/din-events-v2 --gru runs/avito-real/gru-pair-third/gru-fit/gru-din-plus --lgbm "$run/lightgbm" --output "$run/blend" --gpu 0
+```
+
+Контрольная смесь сохраняет веса 70% CatBoost и 30% GRU из предыдущего прогона. Для CatBoost + LightGBM и CatBoost + LightGBM + GRU перебираются неотрицательные веса с шагом 0,05 и суммой 1. Веса подбираются только на ранней `val`. Отчёт включает полную NDCG трёх смесей и парные интервалы разниц на поздней `val`.
+
 Команду для сабмишена можно запустить в отдельном терминале, когда очередь уже работает. Она дождётся сравнения, выберет лучший из четырёх вариантов по полной NDCG поздней `val` и применит его к `test`. Для CatBoost все части используют общую подготовку признаков каждого тестового батча. Итоговые `submission.parquet` и `recipe.json` появятся в указанной папке после проверки формата и совпадения всех ключей с образцом Авито.
 
 ```powershell
