@@ -3,6 +3,7 @@
 import argparse
 import json
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from time import perf_counter
 
 import lightgbm as lgb
@@ -76,6 +77,9 @@ def train(args):
         "seed": 42,
         "verbose": -1,
     }
+    if args.opencl is not None:
+        platform, device = args.opencl
+        params.update(device_type="gpu", gpu_platform_id=platform, gpu_device_id=device, verbose=1)
     print(f"Training LightGBM: {len(y_train):,} candidates ({train_feeds:,} feeds), {args.iterations} rounds", flush=True)
     model = lgb.train(
         params,
@@ -98,9 +102,6 @@ def train(args):
     m_early = ndcg(joined.filter(pl.col("feed_id").is_in(early_ids)))
     m_late = ndcg(joined.filter(pl.col("feed_id").is_in(late_ids)))
 
-    args.output.mkdir(parents=True)
-    model.save_model(str(args.output / "model.txt"))
-    predictions.write_parquet(args.output / "val_predictions.parquet")
     report = {
         "model": f"lgbm-{args.variant}",
         "variant": args.variant,
@@ -110,22 +111,33 @@ def train(args):
         "tuning_cutoff_timestamp": cutoff,
         "options": {"train_offset": args.train_offset, "iterations": args.iterations, "learning_rate": args.lr,
                     "num_leaves": args.num_leaves, "threads": args.threads, "early_stop_eval_at": full_cutoff,
-                    "lightgbm": lgb.__version__},
+                    "lightgbm": lgb.__version__, "opencl": args.opencl},
         "tuning": m_early,
         "holdout": m_late,
         "val": m_all,
         "seconds": round(perf_counter() - start, 2),
         "peak_ram_mib": peak_ram_mib(),
     }
-    (args.output / "metrics.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    with TemporaryDirectory(dir=args.output.parent) as staging:
+        saved = Path(staging) / "model"
+        saved.mkdir()
+        (saved / "model.txt").write_text(model.model_to_string(), encoding="utf-8")
+        predictions.write_parquet(saved / "val_predictions.parquet")
+        (saved / "metrics.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        saved.rename(args.output)
     print(json.dumps(report, indent=2), flush=True)
     print(f"Finished lgbm-{args.variant}: holdout_ndcg={m_late['ndcg']:.8f}", flush=True)
+
+
+def load_model(path):
+    return lgb.Booster(model_str=path.read_text(encoding="utf-8"))
 
 
 def predict(args):
     if args.output.exists():
         raise FileExistsError(args.output)
-    model = lgb.Booster(model_file=str(args.model))
+    model = load_model(args.model)
     features = model.feature_name()
     template = pl.read_parquet(args.data / "sample_submission.parquet", columns=KEYS)
     chunks = []
@@ -150,6 +162,8 @@ def main():
     tr.add_argument("--lr", type=float, default=0.05)
     tr.add_argument("--num-leaves", type=int, default=63)
     tr.add_argument("--tune-before", type=int)
+    tr.add_argument("--opencl", nargs=2, type=int, metavar=("PLATFORM", "DEVICE"),
+                    help="Use this LightGBM OpenCL platform and device")
     tr.set_defaults(run=train)
     pr = sub.add_parser("predict")
     pr.add_argument("--model", type=Path, required=True)

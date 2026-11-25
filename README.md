@@ -70,7 +70,7 @@ python -m venv .venv
 
 ### LightGBM и Z-бленд с сохранёнными прогнозами CatBoost и GRU
 
-LightGBM LambdaRank работает на CPU. Пример использует признаки `din-events-v2` и первые 200 000 лент. Выбор числа деревьев идёт по NDCG на ранней `val` с отсечением на длине её самой длинной ленты. Для итогового сравнения `lightgbm_blend.py` считает полную NDCG и использует CUDA при указании `--gpu`.
+Пример использует LightGBM LambdaRank, признаки `din-events-v2` и первые 200 000 лент. Для GPU-бустинга добавьте `--opencl PLATFORM DEVICE` к команде обучения и проверьте название видеокарты в строке `Using GPU Device`. Нумерация OpenCL в LightGBM зависит от машины. Выбор числа деревьев идёт по NDCG на ранней `val` с отсечением на длине её самой длинной ленты. Для итогового сравнения `lightgbm_blend.py` считает полную NDCG и использует CUDA при указании `--gpu`.
 
 ```powershell
 $data = 'C:/study/AvitoData/competition'
