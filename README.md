@@ -142,6 +142,33 @@ $round = 'avito-families-v1'
 
 ### Полный train по частям
 
+#### Обмен частями `v3-robust-full`
+
+Используйте одну версию ветки `codex/v3-robust-sync` и один файл `.parts-key` на всех компьютерах. Получите ключ у Кирилла личным сообщением и положите его в `runs/v3-robust-full/.parts-key`. Ключ хранится вне Git. Пакеты из манифеста, JSON-отчёта и двух файлов с прогнозами шифруются до отправки. Ветку GitHub участник должен иметь право записывать.
+
+```powershell
+git fetch origin
+git switch --track origin/codex/v3-robust-sync
+$data = 'C:/study/AvitoData/competition'
+$output = 'runs/v3-robust-full'
+$person = 'savva'  # kirill, savva или dimon
+.\.venv\Scripts\python.exe -m pip install -r requirements-shard-exchange.txt
+.\.venv\Scripts\python.exe build_global_stats.py --data $data --output runs/global_stats
+.\.venv\Scripts\python.exe -u sharded_runs.py train --data $data --output $output `
+    --models din-events-v3-robust --train-feeds 0 --val-feeds 0 --shards 21 --iterations 800 `
+    --predict-test --gpu 0 --threads 8 --ui --report-round v3-robust-full --person $person `
+    --parts-key "$output/.parts-key"
+```
+
+Кирилл собирает части автоматически. Программа подтягивает опубликованные части между прогонами и затем каждые две минуты. Когда все части готовы, она проверяет план и ключи кандидатов, сохраняет `merged/din-events-v3-robust/submission.parquet` и публикует общий отчёт в `team-reports/v3-robust-full/merged`.
+
+После перезапуска незаконченный `train` продолжит прогоны с той же командой. Для возобновления только обмена и сборки после окончания обучения используйте `exchange`. Участники используют прежнее значение `$person`.
+
+```powershell
+.\.venv\Scripts\python.exe -u sharded_runs.py exchange --data $data --output $output `
+    --predict-test --gpu 0 --report-round v3-robust-full --person $person --parts-key "$output/.parts-key"
+```
+
 Команды используют все 3 151 208 лент `train` и всю `val`. Каждая из 21 части содержит около 150 000 лент. Чтение идёт напрямую из архива в распакованном виде, общие эмбеддинги остаются в исходном memmap. Каждая часть обучает свой экземпляр выбранной модели. Сборка усредняет Z-нормализованные внутри ленты скоры этих экземпляров на одинаковых кандидатах.
 
 | Кто | Части | Всего лент train |

@@ -13,3 +13,4 @@ baseline.zip
 .env
 .env.*
 !.env.example
+.parts-key
