@@ -122,6 +122,8 @@ def run_model(args, name, output, tune_ids, cutoff, extra=()):
     else:
         command.extend(["--epochs", str(args.epochs), "--batch-size", str(args.batch_size),
                         "--device", args.neural_device, "--history-window", str(args.history_window)])
+        if args.prefetch_neural:
+            command.append("--prefetch")
     if args.train_offset:
         command.extend(["--train-offset", str(args.train_offset)])
     subprocess.run([*command, *extra], check=True)
@@ -284,6 +286,8 @@ def run_benchmark(args, labels, cutoff, tune_ids, metric, selected):
                "baseline_zip": str(args.baseline_zip) if args.baseline_zip else None,
                "family_blends": args.family_blends, "stack": args.stack, "optuna_trials": args.optuna_trials,
                "reuse_models_from": [str(path) for path in args.reuse_models_from], "no_rrf": args.no_rrf}
+    if args.prefetch_neural:
+        options["prefetch_neural"] = True
     report_path = args.output / "report.json"
     if args.resume and report_path.is_file():
         previous = json.loads(report_path.read_text(encoding="utf-8"))
@@ -405,6 +409,7 @@ def main():
     run.add_argument("--stack", action="store_true")
     run.add_argument("--optuna-trials", type=int, default=48)
     run.add_argument("--no-rrf", action="store_true")
+    run.add_argument("--prefetch-neural", action="store_true", help="Prepare the next CPU batch for neural.py")
     run.set_defaults(action=benchmark)
     diagnostic = commands.add_parser("diagnose")
     diagnostic.set_defaults(action=diagnose)

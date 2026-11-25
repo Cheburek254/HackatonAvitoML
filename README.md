@@ -203,9 +203,20 @@ $round = 'avito-full-v1'
 - Савва — [форма listwise](reports/listwise.md)
 - Димон — [форма последовательных моделей](reports/sequence.md)
 
-Числа берите из `report.json`. Лимиты и фактические размеры указаны в `train_feed_limit` / `val_feed_limit` и `train_feeds` / `val_feeds`. Для полной NDCG используйте поля `tuning.ndcg`, `holdout.ndcg` и `val.ndcg` из `models`. Время и пик RAM указаны в `seconds` и `peak_ram_mib`. Если модель завершилась с ошибкой, запишите этап и сообщение вместо метрики. Савва и Димон также отмечают наличие OOF-файла и число лент с OOF-скорами. GitHub хранит текстовые сводки. Файлы со скорами и веса передавайте внутри команды.
+Числа берите из `report.json`. Лимиты и фактические размеры указаны в `train_feed_limit` / `val_feed_limit` и `train_feeds` / `val_feeds`. Для полной NDCG используйте поля `tuning.ndcg`, `holdout.ndcg` и `val.ndcg` из `models`. Время и пик RAM указаны в `seconds` и `peak_ram_mib`. Если модель завершилась с ошибкой, запишите этап и сообщение вместо метрики. Савва и Димон также отмечают наличие OOF-файла и число лент с OOF-скорами.
+
+К готовому отчёту можно приложить комплект для воспроизведения. В `REPRODUCE.md` укажите версию датасета, размер и смещение train, разбиение val, команды обучения и предсказания, чекпоинты и формулу смешивания. Передайте `--revision` с коммитом обучения и по одному `--checkpoint` на каждый нужный файл относительно папки `report.json`. Для моделей с дополнительными параметрами включите нужные `behavior.npz` или `centers.npy`. Публикуйте только те веса, которые готовы выложить в публичный репозиторий. Сырые данные и Parquet остаются локально.
+
+```powershell
+.\.venv\Scripts\python.exe team_reports.py publish --round avito-pilots --name example --report runs/example/report.json --revision b45cfc4 --reproduce runs/example/REPRODUCE.md --checkpoint din-events-v2/model.cbm --checkpoint gru-din-plus/model.pt
+.\.venv\Scripts\python.exe team_reports.py pull --round avito-pilots --with-artifacts
+```
+
+Файлы и команды появятся в папке отчёта на GitHub. При скачивании комплект сохраняется рядом с локальной сводкой в каталоге с именем отчёта. Скрипт проверяет размер и SHA‑256 каждого чекпоинта. Лимит составляет 90 МиБ на файл.
 
 ## Окно обучения на GPU
+
+Для ускорения моделей из `neural.py` включите «Предзагрузка батчей нейросети» в окне или добавьте `--prefetch-neural` к команде `experiments.py benchmark`. Один фоновый поток подготавливает следующий батч на CPU одновременно с вычислениями текущего батча на GPU. Размер батча и порядок данных задаются обычными параметрами запуска.
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install -r requirements-gpu.txt

@@ -1,6 +1,7 @@
 """Train candidate-set and history-aware neural rankers on Avito feeds."""
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
 from time import perf_counter
@@ -236,8 +237,27 @@ def loss_for(variant, scores, target, padding):
     return (losses.masked_fill(~pairs, 0).sum(dim=(1, 2)) / pairs.sum(dim=(1, 2)).clamp_min(1)).mean()
 
 
-def loader(dataset, batch_size, shuffle=False):
-    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, collate_fn=collate)
+class PrefetchBatches:
+    """Prepare one CPU batch ahead while CUDA processes the current batch."""
+
+    def __init__(self, batches):
+        self.batches = batches
+
+    def __len__(self):
+        return len(self.batches)
+
+    def __iter__(self):
+        source = iter(self.batches)
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="avito-batches") as worker:
+            pending = worker.submit(next, source, None)
+            while (batch := pending.result()) is not None:
+                pending = worker.submit(next, source, None)
+                yield batch
+
+
+def loader(dataset, batch_size, shuffle=False, *, prefetch=False):
+    batches = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, collate_fn=collate)
+    return PrefetchBatches(batches) if prefetch else batches
 
 
 def scores(model, batches, device):
@@ -286,15 +306,15 @@ def train(args):
     train_set = Feeds(args.data / "train", args.train_feeds, True, args.history_window, use_history,
                       offset=args.train_offset, rich_features=rich)
     val_set = Feeds(args.data / "val", args.val_feeds, True, args.history_window, use_history, rich_features=rich)
-    train_batches = loader(train_set, args.batch_size, shuffle=True)
+    train_batches = loader(train_set, args.batch_size, shuffle=True, prefetch=args.prefetch)
     val_labels = labels(val_set)
-    tune_labels, tune_batches = val_labels, loader(val_set, args.batch_size)
+    tune_labels, tune_batches = val_labels, loader(val_set, args.batch_size, prefetch=args.prefetch)
     if args.tune_before is not None:
         indices = np.flatnonzero(val_set.feeds["timestamp"].to_numpy() < args.tune_before)
         if not 0 < len(indices) < len(val_set):
             raise ValueError("--tune-before must divide the selected validation feeds into two nonempty sets")
         tune_labels = val_labels.filter(pl.col("feed_id").is_in(val_set.feeds["feed_id"][indices]))
-        tune_batches = loader(Subset(val_set, indices.tolist()), args.batch_size)
+        tune_batches = loader(Subset(val_set, indices.tolist()), args.batch_size, prefetch=args.prefetch)
     model = Ranker(args.variant).to(args.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.0001)
     scheduler = (torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, len(train_batches) * args.epochs), eta_min=1e-5)
@@ -321,7 +341,7 @@ def train(args):
             best, best_epoch = metric, epoch
             best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
     model.load_state_dict(best_state)
-    predictions = scores(model, loader(val_set, args.batch_size), args.device)
+    predictions = scores(model, loader(val_set, args.batch_size, prefetch=args.prefetch), args.device)
     report = {f"val_{name}": value for name, value in ndcg(attach_scores(val_labels, predictions)).items()}
     report.update(variant=args.variant, best_epoch=best_epoch, tune_before=args.tune_before, tuning_curve=curve,
                   train_feeds=len(train_set), val_feeds=len(val_set),
@@ -390,6 +410,7 @@ def main():
     training.add_argument("--val-feeds", type=int, default=0)
     training.add_argument("--history-window", type=int, default=32)
     training.add_argument("--tune-before", type=int)
+    training.add_argument("--prefetch", action="store_true", help="Prepare one CPU batch ahead")
     training.set_defaults(run=train)
     oof_command = commands.add_parser("oof")
     oof_command.add_argument("--variant", choices=VARIANTS, required=True)
