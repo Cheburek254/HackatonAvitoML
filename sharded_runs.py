@@ -215,7 +215,7 @@ def watch_parts(args, exchange, parts, assigned):
 
 
 def resume_exchange(args):
-    manifest_path = next(sorted(args.output.glob("parts/part-*/part.json")), None)
+    manifest_path = min(args.output.glob("parts/part-*/part.json"), default=None)
     if manifest_path is None:
         raise ValueError("No training manifest exists to resume the exchange")
     settings = json.loads(manifest_path.read_text(encoding="utf-8"))["settings"]
