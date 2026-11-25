@@ -32,6 +32,10 @@ FEED_CONTEXT_FEATURES = [
     "cat_share_in_feed", "f5_zscore", "f5_minus_max", "f5_cat_delta", "f3_zscore", "feed_size",
     "top5_f5_cosine", "din_long_max_cosine", "din_long_ev_other_max",
 ]
+GLOBAL_STATS_FEATURES = [
+    "global_item_shows_log", "global_item_ctr", "global_item_mean_pos",
+    "global_item_ctr_delta", "global_item_pos_delta",
+]
 SIM_FEATURES = ["sim_top16_cosine", "sim_recent_cosine", "sim_matching_category_share"]
 MIND_FEATURES = ["mind_best_cosine", "mind_category_cosine", "mind_interest_count"]
 SIM_RANK_SOURCES = ["user_item_cosine", "recent_items_cosine", "din_max_cosine", "din_top3_cosine",
@@ -60,6 +64,8 @@ VARIANTS = {
     "din-events": [*FEATURES, *DIN_FEATURES, *EVENT_DIN_FEATURES],
     "din-events-pos": [*FEATURES, *DIN_FEATURES, *EVENT_DIN_FEATURES, "pos_bias"],
     "din-events-v2": [*FEATURES, *DIN_FEATURES, *EVENT_DIN_FEATURES, *FEED_CONTEXT_FEATURES],
+    "din-events-v3": [*FEATURES, *DIN_FEATURES, *EVENT_DIN_FEATURES, *FEED_CONTEXT_FEATURES, *GLOBAL_STATS_FEATURES],
+    "din-events-v3-qsm": [*FEATURES, *DIN_FEATURES, *EVENT_DIN_FEATURES, *FEED_CONTEXT_FEATURES, *GLOBAL_STATS_FEATURES],
 }
 VARIANTS["strong-gbdt"] = [*FEATURES, *CATEGORY_TREND_FEATURES, *SIM_FEATURES, *behavior.FEATURES["strong-gbdt"]]
 STACK_FEATURES = ["stack_joint_z", "stack_gru_z"]
@@ -246,17 +252,62 @@ def vector_features(feed, embeddings, feature_names, reference, clusters=None):
     return result
 
 
-def expand_batch(feeds, embeddings, labeled, features, reference, clusters=None):
+def load_global_item_stats():
+    stats_dir = Path(__file__).resolve().parent / "runs" / "global_stats"
+    path = stats_dir / "item_stats.parquet"
+    if not path.is_file():
+        raise FileNotFoundError(f"Global stats not found at {path}; run build_global_stats.py first")
+    meta = json.loads((stats_dir / "meta.json").read_text(encoding="utf-8"))
+    df = pl.read_parquet(path)
+    return (
+        df["item_id"].to_numpy(),
+        df["item_shows"].to_numpy(),
+        df["item_clicks"].to_numpy(),
+        df["item_pos_sum"].to_numpy(),
+        float(meta["prior"]),
+    )
+
+
+def apply_global_item_stats(candidates, global_stats, is_train):
+    g_ids, g_shows, g_clicks, g_pos_sum, prior = global_stats
+    item_ids = candidates["item_id"].to_numpy()
+    idx = np.searchsorted(g_ids, item_ids)
+    clipped = np.minimum(idx, len(g_ids) - 1)
+    found = (item_ids > 0) & (g_ids[clipped] == item_ids)
+    shows = np.where(found, g_shows[clipped], 0).astype(np.float64)
+    clicks = np.where(found, g_clicks[clipped], 0).astype(np.float64)
+    pos_sum = np.where(found, g_pos_sum[clipped], 0).astype(np.float64)
+    if is_train and "target" in candidates.columns:
+        shows = np.maximum(shows - 1.0, 0.0)
+        clicks = np.maximum(clicks - candidates["target"].to_numpy().astype(np.float64), 0.0)
+        if "pos" in candidates.columns:
+            pos_sum = np.maximum(pos_sum - candidates["pos"].to_numpy().astype(np.float64), 0.0)
+    shows_log = np.log1p(shows).astype(np.float32)
+    ctr = ((clicks + 30.0 * prior) / (shows + 30.0)).astype(np.float32)
+    mean_pos = ((pos_sum + 20.0 * 40.0) / (shows + 20.0)).astype(np.float32)
+    return candidates.with_columns(
+        pl.Series("global_item_shows_log", shows_log, dtype=pl.Float32),
+        pl.Series("global_item_ctr", ctr, dtype=pl.Float32),
+        pl.Series("global_item_mean_pos", mean_pos, dtype=pl.Float32),
+    ).with_columns(
+        (pl.col("global_item_ctr") - pl.col("global_item_ctr").mean().over("feed_id")).cast(pl.Float32).alias("global_item_ctr_delta"),
+        (pl.col("global_item_mean_pos") - pl.col("global_item_mean_pos").mean().over("feed_id")).cast(pl.Float32).alias("global_item_pos_delta"),
+    )
+
+
+def expand_batch(feeds, embeddings, labeled, features, reference, clusters=None, global_stats=None, is_train=False):
     per_feed = [vector_features(feed, embeddings, features, reference, clusters) for feed in feeds.iter_rows(named=True)]
     has_pos = "pos" in feeds.columns
     arrays = [*CANDIDATE_COLUMNS, *(["target"] if labeled else []), *(["pos"] if has_pos else [])]
     candidates = feeds.select("feed_id", *arrays).explode(arrays).drop("item_id__embedding_idx")
+    if global_stats is not None:
+        candidates = apply_global_item_stats(candidates, global_stats, is_train)
     if "pos_bias" in features:
         candidates = candidates.with_columns(
             pl.col("pos").cast(pl.Float32).alias("pos_bias") if has_pos else pl.lit(0.0, dtype=pl.Float32).alias("pos_bias")
         )
-        if has_pos:
-            candidates = candidates.drop("pos")
+    if has_pos:
+        candidates = candidates.drop("pos")
     candidates = candidates.with_columns(
         *[
             pl.Series(name, np.concatenate([columns[name] for columns in per_feed]).astype(np.float32))
@@ -333,7 +384,8 @@ def candidate_batches(split, *, features=FEATURES, labeled=False, max_feeds=0,
         columns.extend(HISTORY_COLUMNS)
     if EVENT_DIN_FEATURES[0] in features:
         columns.extend(["history__event_type", "history__event_source"])
-    if "pos_bias" in features:
+    need_global = GLOBAL_STATS_FEATURES[0] in features
+    if "pos_bias" in features or (need_global and split.name == "train"):
         first_part = next(iter(sorted((split / "impressions").glob("part-*.parquet"))), None)
         if first_part is not None and "pos" in pq.ParquetFile(first_part).schema_arrow.names:
             columns.append("pos")
@@ -344,6 +396,8 @@ def candidate_batches(split, *, features=FEATURES, labeled=False, max_feeds=0,
     if after is not None or before is not None:
         columns.append("timestamp")
     embeddings = open_embeddings(split)
+    global_stats = load_global_item_stats() if need_global else None
+    is_train = split.name == "train"
     clusters = None
     if centers is not None:
         candidate_key = "item_id__embedding_idx"
@@ -359,7 +413,7 @@ def candidate_batches(split, *, features=FEATURES, labeled=False, max_feeds=0,
         if before is not None:
             batch = batch.filter(pl.col("timestamp") < before)
         if batch.height:
-            yield expand_batch(batch, embeddings, labeled, features, reference, clusters)
+            yield expand_batch(batch, embeddings, labeled, features, reference, clusters, global_stats, is_train)
 
 
 def read_candidates(split, **kwargs):
@@ -408,10 +462,17 @@ def train_centers(args):
 
 
 def new_model(args, iterations):
+    if args.variant == "lambda":
+        loss = "LambdaMart:metric=NDCG"
+    elif args.variant == "din-events-v3-qsm":
+        loss = "QuerySoftMax"
+    else:
+        loss = "YetiRank"
+    depth = 7 if args.variant == "din-events-v3-qsm" else 6
     return CatBoostRanker(
-        loss_function="LambdaMart:metric=NDCG" if args.variant == "lambda" else "YetiRank",
+        loss_function=loss,
         eval_metric="RMSE" if args.device == "gpu" else NDCG,
-        task_type=args.device.upper(), iterations=iterations, depth=6, learning_rate=0.1,
+        task_type=args.device.upper(), iterations=iterations, depth=depth, learning_rate=0.1,
         random_seed=42, thread_count=args.threads, allow_writing_files=False,
         **({"devices": "0", "gpu_ram_part": .65} if args.device == "gpu" else {}),
     )
