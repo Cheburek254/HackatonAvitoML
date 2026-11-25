@@ -1,0 +1,9 @@
+{
+  "code_revision": "b47fdcbf617a5528ce365d6bab8f714670a9ff2c",
+  "checkpoints": {
+    "gru-din-v4/model.pt": {
+      "bytes": 2725587,
+      "sha256": "1caa073881533cb298228d6d20c395e79b14a7f1f0b5bd003b51d89d50c2ee18"
+    }
+  }
+}
