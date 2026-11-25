@@ -20,13 +20,14 @@ from ranker import BASE_FEATURES, CANDIDATE_COLUMNS, HISTORY_COLUMNS, feed_batch
 
 TIE_VARIANTS = ("neural-din-plus-ties", "gru-din-plus-ties")
 VARIANTS = ("transformer", "transformer-listmle", "avito-joint", "neural-din", "bst", "gru-din", "sasrec",
-            "set-transformer", "neural-pairwise", "neural-din-plus", "gru-din-plus", "gru-din-v3", "gru-din-v4", *TIE_VARIANTS)
+            "set-transformer", "neural-pairwise", "neural-din-plus", "gru-din-plus", "gru-din-v3", "gru-din-v4",
+            "gru-din-v4-listnet", *TIE_VARIANTS)
 HISTORY_VARIANTS = {"avito-joint", "neural-din", "bst", "gru-din", "sasrec", "neural-pairwise",
-                    "neural-din-plus", "gru-din-plus", "gru-din-v3", "gru-din-v4", *TIE_VARIANTS}
-RICH_VARIANTS = {"neural-din-plus", "gru-din-plus", "gru-din-v3", "gru-din-v4", *TIE_VARIANTS}
-GRU_VARIANTS = {"gru-din", "gru-din-plus", "gru-din-v3", "gru-din-v4", "gru-din-plus-ties"}
-V3_VARIANTS = {"gru-din-v3", "gru-din-v4"}
-V4_VARIANTS = {"gru-din-v4"}
+                    "neural-din-plus", "gru-din-plus", "gru-din-v3", "gru-din-v4", "gru-din-v4-listnet", *TIE_VARIANTS}
+RICH_VARIANTS = {"neural-din-plus", "gru-din-plus", "gru-din-v3", "gru-din-v4", "gru-din-v4-listnet", *TIE_VARIANTS}
+GRU_VARIANTS = {"gru-din", "gru-din-plus", "gru-din-v3", "gru-din-v4", "gru-din-v4-listnet", "gru-din-plus-ties"}
+V3_VARIANTS = {"gru-din-v3", "gru-din-v4", "gru-din-v4-listnet"}
+V4_VARIANTS = {"gru-din-v4", "gru-din-v4-listnet"}
 
 
 def id_tensor(values):
@@ -344,7 +345,16 @@ def loss_for(variant, scores, target, padding):
     pairs = (target[:, :, None] > target[:, None, :]) & ~padding[:, None, :]
     weights = (actual[:, :, None] - actual[:, None, :]).abs() / ideal[:, None, None]
     losses = F.softplus(scores[:, None, :] - scores[:, :, None]) * weights
-    return (losses.masked_fill(~pairs, 0).sum(dim=(1, 2)) / pairs.sum(dim=(1, 2)).clamp_min(1)).mean()
+    pairwise = (losses.masked_fill(~pairs, 0).sum(dim=(1, 2)) / pairs.sum(dim=(1, 2)).clamp_min(1)).mean()
+    if variant == "gru-din-v4-listnet":
+        pos_sum = target.masked_fill(padding, 0).sum(dim=1)
+        has_pos = pos_sum > 0
+        if has_pos.any():
+            log_probs = F.log_softmax(scores.masked_fill(padding, -1e9), dim=1)
+            target_prob = target.masked_fill(padding, 0) / pos_sum.clamp_min(1.0)[:, None]
+            listnet = -(target_prob * log_probs).sum(dim=1)[has_pos].mean()
+            return 0.5 * pairwise + 0.5 * listnet
+    return pairwise
 
 
 class PrefetchBatches:

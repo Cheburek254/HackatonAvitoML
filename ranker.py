@@ -40,6 +40,10 @@ GLOBAL_STATS_FEATURES = [
     "global_item_shows_log", "global_item_ctr", "global_item_mean_pos",
     "global_item_ctr_delta", "global_item_pos_delta",
 ]
+V4_EXTRA_FEATURES = [
+    "global_item_hist_log", "global_item_hist_delta", "global_user_feeds_log", "global_user_ctr",
+    "cat_din_max_cosine", "f5_x_din_decay", "f5z_x_din_decay", "f1_zscore", "f2_zscore", "f4_zscore",
+]
 TOP_F5 = "top5_f5_cosine"
 TOP_F5_WITH_TIES = "top5_f5_cosine_ties"
 SIM_FEATURES = ["sim_top16_cosine", "sim_recent_cosine", "sim_matching_category_share"]
@@ -72,6 +76,7 @@ VARIANTS = {
     "din-events-v2": [*FEATURES, *DIN_FEATURES, *EVENT_DIN_FEATURES, *FEED_CONTEXT_FEATURES],
     "din-events-v3": [*FEATURES, *DIN_FEATURES, *EVENT_DIN_FEATURES, *FEED_CONTEXT_FEATURES, *GLOBAL_STATS_FEATURES],
     "din-events-v3-qsm": [*FEATURES, *DIN_FEATURES, *EVENT_DIN_FEATURES, *FEED_CONTEXT_FEATURES, *GLOBAL_STATS_FEATURES],
+    "din-events-v4-qsm": [*FEATURES, *DIN_FEATURES, *EVENT_DIN_FEATURES, *FEED_CONTEXT_FEATURES, *GLOBAL_STATS_FEATURES, *V4_EXTRA_FEATURES],
 }
 VARIANTS["din-events-v2-ties"] = [
     TOP_F5_WITH_TIES if name == TOP_F5 else name for name in VARIANTS["din-events-v2"]
@@ -246,6 +251,19 @@ def vector_features(feed, embeddings, feature_names, reference, clusters=None):
             positions[recent_vectors],
         )
         result.update(zip(EVENT_DIN_FEATURES, values, strict=True))
+    if "cat_din_max_cosine" in feature_names:
+        rec_items = history_items[recent_vectors]
+        rec_valid = np.linalg.norm(rec_items, axis=1) > 0
+        rec_items = rec_items[rec_valid]
+        rec_cats = history_categories[history_present][recent_vectors][rec_valid]
+        if len(rec_items):
+            sims = pair_cosine(items, rec_items)
+            same_cat = (categories[:, None] != 0) & (categories[:, None] == rec_cats[None, :])
+            masked = np.where(same_cat, sims, -2.0)
+            best_same = masked.max(axis=1)
+            result["cat_din_max_cosine"] = np.where(same_cat.any(axis=1), best_same, 0.0).astype(np.float32)
+        else:
+            result["cat_din_max_cosine"] = np.zeros(len(item_ids), dtype=np.float32)
     top_feature = TOP_F5_WITH_TIES if TOP_F5_WITH_TIES in feature_names else TOP_F5
     if top_feature in feature_names:
         f5 = np.nan_to_num(np.asarray(feed["f5"], dtype=np.float32), nan=-1e9)
@@ -277,17 +295,26 @@ def load_global_item_stats():
         raise FileNotFoundError(f"Global stats not found at {path}; run build_global_stats.py first")
     meta = json.loads((stats_dir / "meta.json").read_text(encoding="utf-8"))
     df = pl.read_parquet(path)
+    hist_col = df["item_hist_count"].to_numpy() if "item_hist_count" in df.columns else np.zeros(df.height, dtype=np.int32)
+    u_path = stats_dir / "user_stats.parquet"
+    if u_path.is_file():
+        udf = pl.read_parquet(u_path)
+        u_tuple = (udf["user_id"].to_numpy(), udf["user_feeds"].to_numpy(), udf["user_shows"].to_numpy(), udf["user_clicks"].to_numpy())
+    else:
+        u_tuple = None
     return (
         df["item_id"].to_numpy(),
         df["item_shows"].to_numpy(),
         df["item_clicks"].to_numpy(),
         df["item_pos_sum"].to_numpy(),
+        hist_col,
+        u_tuple,
         float(meta["prior"]),
     )
 
 
-def apply_global_item_stats(candidates, global_stats, is_train):
-    g_ids, g_shows, g_clicks, g_pos_sum, prior = global_stats
+def apply_global_item_stats(candidates, global_stats, is_train, features):
+    g_ids, g_shows, g_clicks, g_pos_sum, g_hist, u_tuple, prior = global_stats
     item_ids = candidates["item_id"].to_numpy()
     idx = np.searchsorted(g_ids, item_ids)
     clipped = np.minimum(idx, len(g_ids) - 1)
@@ -295,6 +322,7 @@ def apply_global_item_stats(candidates, global_stats, is_train):
     shows = np.where(found, g_shows[clipped], 0).astype(np.float64)
     clicks = np.where(found, g_clicks[clipped], 0).astype(np.float64)
     pos_sum = np.where(found, g_pos_sum[clipped], 0).astype(np.float64)
+    hist_c = np.where(found, g_hist[clipped], 0).astype(np.float64)
     if is_train and "target" in candidates.columns:
         shows = np.maximum(shows - 1.0, 0.0)
         clicks = np.maximum(clicks - candidates["target"].to_numpy().astype(np.float64), 0.0)
@@ -303,23 +331,50 @@ def apply_global_item_stats(candidates, global_stats, is_train):
     shows_log = np.log1p(shows).astype(np.float32)
     ctr = ((clicks + 30.0 * prior) / (shows + 30.0)).astype(np.float32)
     mean_pos = ((pos_sum + 20.0 * 40.0) / (shows + 20.0)).astype(np.float32)
-    return candidates.with_columns(
+    cols = [
         pl.Series("global_item_shows_log", shows_log, dtype=pl.Float32),
         pl.Series("global_item_ctr", ctr, dtype=pl.Float32),
         pl.Series("global_item_mean_pos", mean_pos, dtype=pl.Float32),
-    ).with_columns(
+    ]
+    if "global_item_hist_log" in features:
+        cols.append(pl.Series("global_item_hist_log", np.log1p(hist_c).astype(np.float32), dtype=pl.Float32))
+    if "global_user_ctr" in features and u_tuple is not None and "user_id" in candidates.columns:
+        u_ids, u_feeds, u_shows, u_clicks = u_tuple
+        cand_u = candidates["user_id"].to_numpy()
+        uidx = np.searchsorted(u_ids, cand_u)
+        uclip = np.minimum(uidx, len(u_ids) - 1)
+        ufound = (cand_u > 0) & (u_ids[uclip] == cand_u)
+        uf = np.where(ufound, u_feeds[uclip], 0).astype(np.float64)
+        us = np.where(ufound, u_shows[uclip], 0).astype(np.float64)
+        uc = np.where(ufound, u_clicks[uclip], 0).astype(np.float64)
+        if is_train and "target" in candidates.columns:
+            feed_len = candidates.select(pl.len().over("feed_id")).to_series().to_numpy().astype(np.float64)
+            feed_hits = candidates.select(pl.col("target").sum().over("feed_id")).to_series().to_numpy().astype(np.float64)
+            uf = np.maximum(uf - 1.0, 0.0)
+            us = np.maximum(us - feed_len, 0.0)
+            uc = np.maximum(uc - feed_hits, 0.0)
+        cols.append(pl.Series("global_user_feeds_log", np.log1p(uf).astype(np.float32), dtype=pl.Float32))
+        cols.append(pl.Series("global_user_ctr", ((uc + 50.0 * prior) / (us + 50.0)).astype(np.float32), dtype=pl.Float32))
+    delta_cols = [
         (pl.col("global_item_ctr") - pl.col("global_item_ctr").mean().over("feed_id")).cast(pl.Float32).alias("global_item_ctr_delta"),
         (pl.col("global_item_mean_pos") - pl.col("global_item_mean_pos").mean().over("feed_id")).cast(pl.Float32).alias("global_item_pos_delta"),
-    )
+    ]
+    if "global_item_hist_delta" in features:
+        delta_cols.append((pl.col("global_item_hist_log") - pl.col("global_item_hist_log").mean().over("feed_id")).cast(pl.Float32).alias("global_item_hist_delta"))
+    return candidates.with_columns(cols).with_columns(delta_cols)
 
 
 def expand_batch(feeds, embeddings, labeled, features, reference, clusters=None, global_stats=None, is_train=False):
     per_feed = [vector_features(feed, embeddings, features, reference, clusters) for feed in feeds.iter_rows(named=True)]
     has_pos = "pos" in feeds.columns
+    need_user = "global_user_ctr" in features and "user_id" in feeds.columns
     arrays = [*CANDIDATE_COLUMNS, *(["target"] if labeled else []), *(["pos"] if has_pos else [])]
-    candidates = feeds.select("feed_id", *arrays).explode(arrays).drop("item_id__embedding_idx")
+    select_cols = ["feed_id", *(["user_id"] if need_user else []), *arrays]
+    candidates = feeds.select(*select_cols).explode(arrays).drop("item_id__embedding_idx")
     if global_stats is not None:
-        candidates = apply_global_item_stats(candidates, global_stats, is_train)
+        candidates = apply_global_item_stats(candidates, global_stats, is_train, features)
+    if need_user:
+        candidates = candidates.drop("user_id")
     if "pos_bias" in features:
         candidates = candidates.with_columns(
             pl.col("pos").cast(pl.Float32).alias("pos_bias") if has_pos else pl.lit(0.0, dtype=pl.Float32).alias("pos_bias")
@@ -359,7 +414,20 @@ def expand_batch(feeds, embeddings, labeled, features, reference, clusters=None,
             ((pl.col("f3") - pl.col("f3").mean().over("feed_id")) / pl.col("f3").std().over("feed_id").fill_null(1.0).clip(lower_bound=1e-6)).cast(pl.Float32).alias("f3_zscore"),
             pl.len().over("feed_id").cast(pl.Float32).alias("feed_size"),
         ])
-    return candidates.with_columns(extra_ranks) if extra_ranks else candidates
+    if "f1_zscore" in features:
+        extra_ranks.extend([
+            ((pl.col("f1") - pl.col("f1").mean().over("feed_id")) / pl.col("f1").std().over("feed_id").fill_null(1.0).clip(lower_bound=1e-6)).cast(pl.Float32).alias("f1_zscore"),
+            ((pl.col("f2") - pl.col("f2").mean().over("feed_id")) / pl.col("f2").std().over("feed_id").fill_null(1.0).clip(lower_bound=1e-6)).cast(pl.Float32).alias("f2_zscore"),
+            ((pl.col("f4") - pl.col("f4").mean().over("feed_id")) / pl.col("f4").std().over("feed_id").fill_null(1.0).clip(lower_bound=1e-6)).cast(pl.Float32).alias("f4_zscore"),
+            (pl.col("f5") * pl.col("din_decay_max_cosine")).cast(pl.Float32).alias("f5_x_din_decay"),
+        ])
+    if extra_ranks:
+        candidates = candidates.with_columns(extra_ranks)
+    if "f5z_x_din_decay" in features:
+        candidates = candidates.with_columns(
+            (pl.col("f5_zscore") * pl.col("din_decay_max_cosine")).cast(pl.Float32).alias("f5z_x_din_decay")
+        )
+    return candidates
 
 
 def feed_batches(split, columns, max_feeds=0, *, offset=0):
@@ -433,7 +501,7 @@ def candidate_batches(split, *, features=FEATURES, labeled=False, max_feeds=0,
         first_part = next(iter(sorted((split / "impressions").glob("part-*.parquet"))), None)
         if first_part is not None and "pos" in pq.ParquetFile(first_part).schema_arrow.names:
             columns.append("pos")
-    if reference is not None:
+    if reference is not None or "global_user_ctr" in features:
         columns.append("user_id")
     if labeled:
         columns.append("target")
@@ -520,11 +588,11 @@ def train_centers(args):
 def new_model(args, iterations):
     if args.variant == "lambda":
         loss = "LambdaMart:metric=NDCG"
-    elif args.variant == "din-events-v3-qsm":
+    elif args.variant in {"din-events-v3-qsm", "din-events-v4-qsm"}:
         loss = "QuerySoftMax"
     else:
         loss = "YetiRank"
-    depth = 7 if args.variant == "din-events-v3-qsm" else 6
+    depth = 7 if args.variant in {"din-events-v3-qsm", "din-events-v4-qsm"} else 6
     return CatBoostRanker(
         loss_function=loss,
         eval_metric="RMSE" if args.device == "gpu" else NDCG,

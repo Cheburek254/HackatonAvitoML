@@ -19,7 +19,7 @@ from ranker import STACK_VARIANTS, VARIANTS, feed_batches
 
 NEURAL = ("transformer", "transformer-listmle", "avito-joint", "neural-din", "bst", "gru-din", "sasrec",
           "set-transformer", "neural-pairwise", "neural-din-plus", "gru-din-plus", "gru-din-v3", "gru-din-v4",
-          "neural-din-plus-ties", "gru-din-plus-ties")
+          "gru-din-v4-listnet", "neural-din-plus-ties", "gru-din-plus-ties")
 OFFICIAL = ("avito-catboost", "avito-transformer")
 CUDA_NEURAL = ("dual-history",)
 LIGHTGBM = "lgbm-din-events-v2"
