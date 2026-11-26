@@ -30,7 +30,7 @@ RICH_VARIANTS = {"neural-din-plus", "gru-din-plus", "gru-din-v3", "gru-din-v4", 
 GRU_VARIANTS = {"gru-din", "gru-din-plus", "gru-din-v3", "gru-din-v4", "gru-din-v4-listnet", "gru-din-v5", "gru-din-xl", "gru-din-plus-ties"}
 V3_VARIANTS = {"gru-din-v3", "gru-din-v4", "gru-din-v4-listnet", "gru-din-v5", "gru-din-xl"}
 V4_VARIANTS = {"gru-din-v4", "gru-din-v4-listnet", "gru-din-v5", "gru-din-xl"}
-V5_VARIANTS = {"gru-din-v5", "gru-din-xl"}
+V5_VARIANTS = {"gru-din-v5"}
 XL_VARIANTS = {"gru-din-xl"}
 
 
@@ -205,14 +205,15 @@ class Feeds(Dataset):
                     top_idx = valid_idx[f5[valid_idx].topk(k).indices]
                     proto = F.normalize(items[top_idx].mean(dim=0, keepdim=True), dim=-1)
                     v3[:, 6] = (items * proto).sum(dim=-1)
-                tail_idx = feed["history__item_id__embedding_idx"][self.window:256]
+                tail_start = min(self.window, 64)
+                tail_idx = feed["history__item_id__embedding_idx"][tail_start:256]
                 if len(tail_idx):
                     tail_vecs, tail_miss = self.vectors(tail_idx)
                     tail_valid = ~tail_miss
                     if tail_valid.any():
                         tail_sims = items @ tail_vecs[tail_valid].T
                         v3[:, 7] = tail_sims.max(dim=1).values
-                        tail_ev = id_tensor(feed["history__event_type"][self.window:256])[tail_valid]
+                        tail_ev = id_tensor(feed["history__event_type"][tail_start:256])[tail_valid]
                         other_m = tail_ev > 1
                         if other_m.any():
                             v3[:, 8] = tail_sims[:, other_m].max(dim=1).values
@@ -292,7 +293,7 @@ class Ranker(nn.Module):
         width = width or (256 if is_xl else (128 if variant in RICH_VARIANTS else 64))
         heads = 8 if width >= 256 else 4
         self.variant = variant
-        self.use_grad_checkpoint = is_xl
+        self.use_grad_checkpoint = False
         self.category = nn.Embedding(256, 8, padding_idx=0)
         if variant in RICH_VARIANTS:
             in_dim = 179 if variant in V5_VARIANTS else (176 if variant in V4_VARIANTS else (170 if variant in V3_VARIANTS else 161))
@@ -640,7 +641,7 @@ def train(args):
     predictions.write_parquet(args.output / "val_predictions.parquet")
     (args.output / "metrics.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(f"Finished {args.variant}: full_val_ndcg={report['val_ndcg']:.6f} (best_step={best_step})", flush=True)
-    if args.tune_before is None and seen_feeds_per_epoch >= 10_000 and not args.output.name.startswith("_"):
+    if seen_feeds_per_epoch >= 10_000 and not args.output.name.startswith("_"):
         try:
             import notify_tg
             msg = (f"✅ {args.variant} finished ({args.output.name})\n"
@@ -758,7 +759,7 @@ def main():
     try:
         args.run(args)
     except Exception as exc:
-        if (args.run is train and getattr(args, "tune_before", None) is None
+        if (args.run is train
                 and (args.train_feeds == 0 or args.train_feeds >= 10_000)
                 and not args.output.name.startswith("_")):
             try:
