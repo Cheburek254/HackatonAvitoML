@@ -43,12 +43,15 @@ def labels_and_blend(data, reference):
                               .15 * pl.col("gru3") + .15 * pl.col("lgbm")).alias("base"))
 
 
-def select_feeds(data):
+def select_feeds(data, before=None):
     files = sorted((data / "train/impressions").glob("part-*.parquet"))
     keys = scan_train(files, ["feed_id", "timestamp"]).collect()
     if keys["feed_id"].n_unique() != len(keys):
         raise ValueError("Duplicate train feed IDs")
-    candidates = (keys.slice(BASE_SIZE).sort(["timestamp", "feed_id"], descending=True).head(SIZE)
+    eligible = keys.slice(BASE_SIZE)
+    if before is not None:
+        eligible = eligible.filter(pl.col("timestamp") < before)
+    candidates = (eligible.sort(["timestamp", "feed_id"], descending=True).head(SIZE)
                   .sort(["timestamp", "feed_id"]))
     if len(candidates) != SIZE or candidates["feed_id"].is_in(keys["feed_id"].head(BASE_SIZE)).any():
         raise ValueError("Adaptation selection overlaps the pretrained rows")
@@ -137,11 +140,10 @@ def checkpoint_model(checkpoint, model):
     return {**checkpoint, "state_dict": {k: v.detach().cpu() for k, v in model.state_dict().items()}}
 
 
-def adapt(args):
-    neural, torch = init_neural(args)
-    from experiments import score_summary
-
-    files, selection = select_feeds(args.data)
+def adaptation_data(args, neural, expected_selection=None, before=None):
+    files, selection = select_feeds(args.data, before)
+    if expected_selection is not None and not selection.equals(pl.read_parquet(expected_selection)):
+        raise ValueError("The selected training feeds differ from the original adaptation")
     first, last = selection["timestamp"].min(), selection["timestamp"].max()
     fit = neural.Feeds(args.data / "train", 1, True, 64, True, rich_features=True, v3_features=True)
     columns = fit.feeds.columns
@@ -155,6 +157,15 @@ def adapt(args):
     fit.global_stats = stats
     fit.is_train = False  # Earlier statistics already exclude every adaptation label.
     note(f"Prepared {len(fit):,} adaptation feeds, timestamps {first}–{last}; stats from {stats_feeds:,} earlier feeds")
+    return fit, selection, stats_feeds
+
+
+def adapt(args):
+    neural, torch = init_neural(args)
+    from experiments import score_summary
+
+    fit, selection, stats_feeds = adaptation_data(args, neural)
+    first, last = selection["timestamp"].min(), selection["timestamp"].max()
 
     from torch.utils.data import Subset
 
