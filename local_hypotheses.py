@@ -235,6 +235,58 @@ def period_blend(args):
            early_fold_feeds=[early["feed_id"].n_unique(), confirm["feed_id"].n_unique()])
 
 
+def adapted_period_blend(args):
+    from ensemble import Slates
+    from pair_blend import paired_interval
+
+    frame = signals(args)
+    frame = scores_into(frame, args.prior/"period/val_predictions.parquet", "second")
+    frame = scores_into(frame, args.runs/"local-evening-200k/adapt-v3/val_predictions.parquet", "adapted_v3")
+
+    def score(data, second_share, adapted_share):
+        gru = (1 - second_share)*pl.col("first") + second_share*pl.col("second")
+        gru3 = (1 - adapted_share)*pl.col("gru3") + adapted_share*pl.col("adapted_v3")
+        return blend(data, gru, gru3=gru3)
+
+    folds = [frame.filter(mask) for mask in (EARLY, CONFIRM)]
+    reference = [ndcg(score(fold, .5, 0))["ndcg"] for fold in folds]
+    trials = []
+    for second_share in (.25, .375, .5, .625, .75):
+        for adapted_share in (0., .25, .5, .75, 1.):
+            values = [ndcg(score(fold, second_share, adapted_share))["ndcg"] for fold in folds]
+            trials.append(dict(second_share=second_share, adapted_share=adapted_share, early_ndcg=values,
+                               min_gain=min(value-base for value, base in zip(values, reference, strict=True))))
+    joint = max((trial for trial in trials if trial["adapted_share"] > 0), key=lambda trial: trial["min_gain"])
+    fixed_v4 = max((trial for trial in trials if trial["second_share"] == .5 and trial["adapted_share"] > 0),
+                   key=lambda trial: trial["min_gain"])
+    atomic_text(args.folder/"selection.json", json.dumps(dict(joint=joint, fixed_v4=fixed_v4), indent=2))
+
+    rows, late_values = [], {}
+    for name, second_share, adapted_share in (
+        ("two-periods-control", .5, 0.),
+        ("fixed-v4-with-adapted-v3", .5, fixed_v4["adapted_share"]),
+        ("joint-early-selected", joint["second_share"], joint["adapted_share"]),
+    ):
+        scored = score(frame, second_share, adapted_share)
+        rows.append(metrics(scored, name))
+        late = Slates(scored.filter(pl.col("timestamp") >= LATE_SPLIT), "cpu")
+        late_values[name] = late.per_feed_ndcg(late.pack("score")).numpy().astype(np.float64)
+        if name == "joint-early-selected":
+            write_scores(scored.select(*KEYS, "score"), args.folder/"val_predictions.parquet")
+    control = rows[0]["holdout"]["ndcg"]
+    if abs(control - .376430923) > 1e-8:
+        raise ValueError(f"Unexpected two-period control: {control}")
+    users = (pl.scan_parquet(str(args.data/"val/impressions/part-*.parquet"))
+             .filter(pl.col("timestamp") >= LATE_SPLIT).select("feed_id", "user_id").sort("feed_id").collect())
+    if not np.array_equal(users["feed_id"].to_numpy(), late.frame["feed_id"].unique(maintain_order=True).to_numpy()):
+        raise ValueError("User rows do not match the validation feeds")
+    intervals = {name: paired_interval(values - late_values["two-periods-control"], users["user_id"].to_numpy())
+                 for name, values in late_values.items() if name != "two-periods-control"}
+    report(args, rows, selection={"joint": joint, "fixed_v4": fixed_v4}, early_trials=trials,
+           early_reference=reference, early_fold_feeds=[fold["feed_id"].n_unique() for fold in folds],
+           holdout_feeds=users.height, split1_end=EARLY_SPLIT, holdout_paired_bootstrap=intervals)
+
+
 def cat_periods(args):
     frame = signals(args)
     evening = args.runs/"local-evening-200k"
@@ -370,7 +422,8 @@ def queue(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("stage", choices=(*STAGES, *EVENING, "cat-periods", "queue", "evening-queue", "cat-queue"))
+    parser.add_argument("stage", choices=(*STAGES, *EVENING, "cat-periods", "adapted-period-blend",
+                                         "queue", "evening-queue", "cat-queue"))
     for key in ("data", "runs", "output"):
         parser.add_argument("--"+key, required=True, type=lambda value: Path(value).resolve())
     parser.add_argument("--gpu", default="0")
@@ -384,5 +437,6 @@ if __name__ == "__main__":
     destination = args.output if args.stage.endswith("queue") else args.folder
     destination.mkdir(parents=True, exist_ok=True)
     {"epochs": gru_run, "period": gru_run, "third-period": gru_run, "adapt-v3": gru_run,
-     "period-blend": period_blend, "cat-periods": cat_periods, "groups": grouping, "qsm": qsm,
+     "period-blend": period_blend, "cat-periods": cat_periods, "adapted-period-blend": adapted_period_blend,
+     "groups": grouping, "qsm": qsm,
      "queue": queue, "evening-queue": queue, "cat-queue": queue}[args.stage](args)
