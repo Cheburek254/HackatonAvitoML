@@ -235,9 +235,61 @@ def period_blend(args):
            early_fold_feeds=[early["feed_id"].n_unique(), confirm["feed_id"].n_unique()])
 
 
+def cat_periods(args):
+    frame = signals(args)
+    evening = args.runs/"local-evening-200k"
+    for name, folder in (("second", args.prior/"period"), ("third", evening/"third-period")):
+        frame = scores_into(frame, folder/"val_predictions.parquet", name)
+    cats = ["qsm"]
+    for name in ("base", "recent", "recent-drop"):
+        path = args.prior/"qsm"/name/"val_predictions.parquet"
+        if path.is_file():
+            frame = scores_into(frame, path, name)
+            cats.append(name)
+    for name, weights in (("two", (.5, .5, 0.)), ("three", (1/3, 1/3, 1/3))):
+        mixture = sum(w*pl.col(c) for w,c in zip(weights, ("first","second","third"), strict=True))
+        frame = frame.with_columns(mixture.alias(name)).with_columns(zscore(name).alias(name))
+
+    def score(data, family, period, cat, weight):
+        pair = weight*pl.col(cat) + (1-weight)*pl.col(period)
+        if family == "full":
+            v4 = .70*pair + .15*pl.col("gru3") + .15*pl.col("lgbm")
+            data = data.with_columns(v4.cast(pl.Float32).alias("v4"))
+            pair = .85*zscore("v4") + .15*pl.col("rob")
+        return data.with_columns(pair.cast(pl.Float32).alias("score"))
+
+    folds = [frame.filter(EARLY), frame.filter(CONFIRM)]
+    selected, curves = {}, {}
+    for family in ("pair", "full"):
+        # The two-family reference is a single-period GRU + published QSM.
+        # The full reference is exactly the existing .40/.30/.15/.15 V4 + robust.
+        base = [ndcg(score(f, family, "first", "qsm", 4/7))["ndcg"] for f in folds]
+        trials = []
+        for period in ("two", "three"):
+            for cat in cats:
+                for weight in (.35, .50, 4/7, .70):
+                    values = [ndcg(score(f, family, period, cat, weight))["ndcg"] for f in folds]
+                    trials.append(dict(period=period, cat=cat, weight=weight, early_ndcg=values,
+                                       min_gain=min(x-y for x,y in zip(values,base,strict=True))))
+        curves[family] = trials
+        selected[family] = max(trials, key=lambda row: row["min_gain"])
+    atomic_text(args.folder/"selection.json", json.dumps(selected, indent=2))
+    rows = [metrics(blend(frame), "full-control")]
+    for family, winner in selected.items():
+        if family == "pair":
+            rows.append(metrics(score(frame, family, "first","qsm",4/7), "pair-control"))
+        chosen = score(frame, family, winner["period"], winner["cat"], winner["weight"])
+        write_scores(chosen.select(*KEYS,"score"), args.folder/f"{family}-val.parquet")
+        rows.append(metrics(chosen, family+"-period-catboost"))
+    report(args, rows, selection=selected, early_trials=curves, available_catboost=cats,
+           selected_by="largest minimum gain over the two early folds within each family",
+           period_weights={"two":[.5,.5,0], "three":[1/3]*3}, cat_weight_grid=[.35,.50,4/7,.70])
+
+
 def queue(args):
     from team_reports import sync
 
+    cat_queue = args.stage == "cat-queue"
     evening = args.stage == "evening-queue"
     watch = args.output/"watch.json"
     if evening:
@@ -245,6 +297,12 @@ def queue(args):
         if Path(prior_watch["status"]).resolve() != (args.prior/"qsm/run.status").resolve():
             raise ValueError("Expected the preceding queue to be at its last QSM stage")
         atomic_text(watch, json.dumps(prior_watch))
+    if cat_queue:
+        previous = args.runs/"local-evening-200k"
+        note("Waiting for the evening period-blend to finish")
+        while not (previous/"period-blend/run.status").exists():
+            keep_awake()
+            sleep(15)
     subprocess.Popen([sys.executable, str(ROOT/"dashboard.py"), "--watch", str(watch)], cwd=ROOT,
                      creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     if evening:
@@ -254,7 +312,8 @@ def queue(args):
             sleep(15)
         note("Preceding QSM exited; starting evening experiments")
     failures = []
-    for name in (EVENING if evening else ("groups", "epochs", "period", "qsm")):
+    stages = ("cat-periods",) if cat_queue else EVENING if evening else ("groups", "epochs", "period", "qsm")
+    for name in stages:
         folder = args.output/name
         folder.mkdir(exist_ok=True)
         result, log, status = folder/"report.json", folder/"run.log", folder/"run.status"
@@ -282,7 +341,15 @@ def queue(args):
             if code:
                 failures.append(name)
                 continue
-        if evening:
+        if cat_queue:
+            instructions = folder/"REPRODUCE.md"
+            atomic_text(instructions, "After local-evening-200k and local-hypotheses-200k, run\n\n"
+                        "`python local_hypotheses.py cat-periods --data competition --runs runs/avito-real "
+                        "--output runs/avito-real/local-cat-periods --gpu 0`\n\n"
+                        "Selected early-fold recipes (weight is the CatBoost share)\n\n```json\n"
+                        + (folder/"selection.json").read_text(encoding="utf-8") + "\n```\n")
+            sync("avito-local-evening", name, result, revision=args.revision, instructions=instructions)
+        elif evening:
             instructions = folder/"REPRODUCE.md"
             recipe = ("Use the Avito validation and pretrained artifacts from v4-next-200k/adapt, "
                       "valishinqa-v4-repro, valishinqa-v4-worktree, v3-robust-full and local-hypotheses-200k/period. "
@@ -302,7 +369,7 @@ def queue(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("stage", choices=(*STAGES, *EVENING, "queue", "evening-queue"))
+    parser.add_argument("stage", choices=(*STAGES, *EVENING, "cat-periods", "queue", "evening-queue", "cat-queue"))
     for key in ("data", "runs", "output"):
         parser.add_argument("--"+key, required=True, type=lambda value: Path(value).resolve())
     parser.add_argument("--gpu", default="0")
@@ -313,7 +380,8 @@ if __name__ == "__main__":
     args.reference = args.runs / "valishinqa-v4-repro"
     args.v4_code = args.runs / "valishinqa-v4-worktree"
     args.folder = args.output / args.stage
-    destination = args.output if args.stage in ("queue", "evening-queue") else args.folder
+    destination = args.output if args.stage.endswith("queue") else args.folder
     destination.mkdir(parents=True, exist_ok=True)
     {"epochs": gru_run, "period": gru_run, "third-period": gru_run, "adapt-v3": gru_run,
-     "period-blend": period_blend, "groups": grouping, "qsm": qsm, "queue": queue, "evening-queue": queue}[args.stage](args)
+     "period-blend": period_blend, "cat-periods": cat_periods, "groups": grouping, "qsm": qsm,
+     "queue": queue, "evening-queue": queue, "cat-queue": queue}[args.stage](args)
