@@ -244,8 +244,9 @@ def cat_periods(args):
     for name in ("base", "recent", "recent-drop"):
         path = args.prior/"qsm"/name/"val_predictions.parquet"
         if path.is_file():
-            frame = scores_into(frame, path, name)
-            cats.append(name)
+            column = f"qsm-{name}"
+            frame = scores_into(frame, path, column)
+            cats.append(column)
     for name, weights in (("two", (.5, .5, 0.)), ("three", (1/3, 1/3, 1/3))):
         mixture = sum(w*pl.col(c) for w,c in zip(weights, ("first","second","third"), strict=True))
         frame = frame.with_columns(mixture.alias(name)).with_columns(zscore(name).alias(name))
