@@ -2,8 +2,10 @@
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+import ctypes
 import gc
 import json
+import os
 from pathlib import Path
 from time import perf_counter
 from uuid import uuid4
@@ -703,6 +705,27 @@ def predict(args):
     submission.write_parquet(args.output)
 
 
+def _configure_windows_console_and_sleep(enable=True):
+    """Prevent Windows sleep and disable cmd.exe QuickEdit click-pause during long runs."""
+    if os.name != "nt":
+        return
+    try:
+        k32 = ctypes.windll.kernel32
+        ES_CONTINUOUS = 0x80000000
+        ES_SYSTEM_REQUIRED = 0x00000001
+        k32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED if enable else ES_CONTINUOUS)
+        if enable:
+            STD_INPUT_HANDLE = -10
+            ENABLE_QUICK_EDIT_MODE = 0x0040
+            ENABLE_EXTENDED_FLAGS = 0x0080
+            handle = k32.GetStdHandle(STD_INPUT_HANDLE)
+            mode = ctypes.c_uint32()
+            if k32.GetConsoleMode(handle, ctypes.byref(mode)):
+                k32.SetConsoleMode(handle, (mode.value & ~ENABLE_QUICK_EDIT_MODE) | ENABLE_EXTENDED_FLAGS)
+    except Exception:
+        pass
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(required=True)
@@ -756,6 +779,8 @@ def main():
         if not torch.cuda.is_available():
             parser.error("CUDA PyTorch is required for --device cuda")
         torch.set_float32_matmul_precision("high")
+    if args.run is train:
+        _configure_windows_console_and_sleep(True)
     try:
         args.run(args)
     except Exception as exc:
@@ -768,6 +793,9 @@ def main():
             except Exception:
                 pass
         raise
+    finally:
+        if args.run is train:
+            _configure_windows_console_and_sleep(False)
 
 
 if __name__ == "__main__":
