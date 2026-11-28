@@ -29,10 +29,12 @@ def signals(args):
     return scores_into(frame, args.runs / "v3-robust-full/merged" / ROBUST / "val_predictions.parquet", "rob")
 
 
-def blend(frame, gru=pl.col("first"), qsm=pl.col("qsm"), robust=pl.col("rob"), gru3=None):
+def blend(frame, gru=pl.col("first"), qsm=pl.col("qsm"), robust=pl.col("rob"), gru3=None, gru_delta=None):
     v4 = pl.col("base") + .30 * (gru - pl.col("gru4")) + .40 * (qsm - pl.col("qsm"))
     if gru3 is not None:
         v4 += .15 * (gru3 - pl.col("gru3"))
+    if gru_delta is not None:
+        v4 += gru_delta * (gru - qsm)
     frame = frame.with_columns(v4.cast(pl.Float32).alias("v4"))
     return frame.with_columns((.85 * zscore("v4") + .15 * robust).cast(pl.Float32).alias("score"))
 
@@ -338,6 +340,50 @@ def average_epochs(args):
            holdout_paired_bootstrap=interval)
 
 
+def history_weights(args):
+    from ensemble import Slates
+    from pair_blend import paired_interval
+
+    frame = signals(args)
+    epoch_report = json.loads((args.prior/"epochs/report.json").read_text(encoding="utf-8"))
+    if epoch_report["best_epoch"] != 5:
+        raise ValueError("Expected saved predictions from the fifth GRU epoch")
+    frame = scores_into(frame, args.prior/"epochs/val_predictions.parquet", "fifth")
+    frame = scores_into(frame, args.prior/"period/val_predictions.parquet", "second")
+    gru = .5*(pl.col("fifth") + pl.col("second"))
+    relative_length = pl.col("history_length").clip(0, 64) / 32 - 1
+    rules = {"fixed-control": None, "more-gru-for-long-history": .05*relative_length,
+             "more-gru-for-short-history": -.05*relative_length}
+    folds = [frame.filter(mask) for mask in (EARLY, CONFIRM)]
+    early_scores = {name: [ndcg(blend(fold, gru, gru_delta=delta))["ndcg"] for fold in folds]
+                    for name, delta in rules.items()}
+    reference = early_scores["fixed-control"]
+    min_gain = {name: min(value - base for value, base in zip(values, reference, strict=True))
+                for name, values in early_scores.items()}
+    selected = max(min_gain, key=min_gain.get)
+    challenger = max((name for name in rules if name != "fixed-control"), key=min_gain.get)
+    atomic_text(args.folder/"selection.json", json.dumps(dict(selected=selected, challenger=challenger,
+                                                             early_scores=early_scores, min_gain=min_gain), indent=2))
+
+    late = pl.col("timestamp") >= LATE_SPLIT
+    rows, per_feed = [], {}
+    for name in dict.fromkeys(("fixed-control", challenger, selected)):
+        scored = blend(frame, gru, gru_delta=rules[name])
+        rows.append(metrics(scored, name))
+        slates = Slates(scored.filter(late), "cpu")
+        per_feed[name] = slates.per_feed_ndcg(slates.pack("score")).numpy().astype(np.float64)
+    if abs(rows[0]["holdout"]["ndcg"] - .37657187723743313) > 1e-8:
+        raise ValueError("Did not reproduce the 0.376572 reference")
+    users = (pl.scan_parquet(str(args.data/"val/impressions/part-*.parquet"))
+             .filter(late).select("feed_id", "user_id").sort("feed_id").collect())
+    if not np.array_equal(users["feed_id"].to_numpy(), slates.frame["feed_id"].unique(maintain_order=True).to_numpy()):
+        raise ValueError("User rows do not match the validation feeds")
+    interval = paired_interval(per_feed[challenger] - per_feed["fixed-control"], users["user_id"].to_numpy())
+    report(args, rows, selected=selected, challenger=challenger, early_scores=early_scores,
+           min_early_gain=min_gain, split1_end=EARLY_SPLIT, holdout_feeds=users.height,
+           max_weight_shift=.05, saturation_history_events=64, qsm_trees=800, holdout_paired_bootstrap=interval)
+
+
 def adapted_period_blend(args):
     from ensemble import Slates
     from pair_blend import paired_interval
@@ -526,7 +572,7 @@ def queue(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("stage", choices=(*STAGES, *EVENING, "cat-periods", "adapted-period-blend", "epochs-trees", "average-epochs",
-                                         "queue", "evening-queue", "cat-queue"))
+                                         "history-weights", "queue", "evening-queue", "cat-queue"))
     for key in ("data", "runs", "output"):
         parser.add_argument("--"+key, required=True, type=lambda value: Path(value).resolve())
     parser.add_argument("--gpu", default="0")
@@ -542,4 +588,5 @@ if __name__ == "__main__":
     {"epochs": gru_run, "period": gru_run, "third-period": gru_run, "adapt-v3": gru_run,
      "period-blend": period_blend, "cat-periods": cat_periods, "adapted-period-blend": adapted_period_blend,
      "groups": grouping, "qsm": qsm, "epochs-trees": epochs_trees, "average-epochs": average_epochs,
+     "history-weights": history_weights,
      "queue": queue, "evening-queue": queue, "cat-queue": queue}[args.stage](args)
