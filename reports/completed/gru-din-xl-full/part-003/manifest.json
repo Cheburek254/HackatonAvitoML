@@ -1,0 +1,9 @@
+{
+  "code_revision": "e5d45844fb43a73a994b808b8e8cc778053560cb",
+  "checkpoints": {
+    "model.pt": {
+      "bytes": 17920459,
+      "sha256": "3be82c4e70864b6da68c2ffaa0e6e7af05831f19775341d636c0e20ad853f089"
+    }
+  }
+}
