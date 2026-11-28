@@ -420,6 +420,77 @@ def compare_gru_weights(args, frame, rules, **settings):
            qsm_trees=800, holdout_paired_bootstrap=interval, **settings)
 
 
+def clip_blend_scores(args):
+    from ensemble import Slates
+    from pair_blend import paired_interval
+
+    frame = epoch5_period_signals(args)
+    for index in (2, 3):
+        path = args.runs.parent/f"gru-din-xl-team-exchange/parts/part-{index:03d}/fit/gru-din-xl/val_predictions.parquet"
+        frame = scores_into(frame, path, f"xl{index}")
+    frame = frame.with_columns((.5*(pl.col("fifth") + pl.col("second"))).alias("gru_control"),
+                               (.5*(pl.col("xl2") + pl.col("xl3"))).alias("xl_pair"))
+    frame = frame.with_columns((.75*pl.col("gru_control") + .25*zscore("xl_pair")).alias("gru_with_xl"))
+    components = ("qsm", "gru_control", "gru_with_xl")
+    frame = frame.with_columns(zscore(name).alias(f"{name}_standardized") for name in components)
+    frame = frame.with_columns(pl.col(f"{name}_standardized").clip(-3, 3).alias(f"{name}_bounded")
+                               for name in components)
+    for name in components:
+        # Preserve the original weight scale, and leave feeds without extreme scores intact.
+        value = pl.col(name)
+        flagged = (pl.col(f"{name}_standardized").abs() > 3).any().over("feed_id")
+        rescaled = zscore(f"{name}_bounded")*value.std(ddof=0).over("feed_id") + value.mean().over("feed_id")
+        frame = frame.with_columns(flagged.alias(f"{name}_changed"),
+                                   pl.when(flagged).then(rescaled).otherwise(value).alias(f"{name}_clipped"))
+
+    def score(data, gru_name, rule):
+        gru_column = f"{gru_name}_clipped" if rule == "clip-gru" else gru_name
+        qsm_column = "qsm_clipped" if rule == "clip-qsm" else "qsm"
+        return blend(data, pl.col(gru_column), qsm=pl.col(qsm_column))
+
+    folds = [frame.filter(mask) for mask in (EARLY, CONFIRM)]
+    rules = ("fixed", "clip-qsm", "clip-gru")
+    trials, selections = {}, {}
+    for gru_name in components[1:]:
+        early = {rule: [ndcg(score(fold, gru_name, rule))["ndcg"] for fold in folds] for rule in rules}
+        gains = {rule: min(new-base for new, base in zip(values, early["fixed"], strict=True))
+                 for rule, values in early.items()}
+        selections[gru_name] = dict(selected=max(gains, key=gains.get),
+                                    challenger=max(rules[1:], key=gains.get))
+        trials[gru_name] = early
+    atomic_text(args.folder/"selection.json", json.dumps(dict(selections=selections, early=trials), indent=2))
+
+    late_mask = pl.col("timestamp") >= LATE_SPLIT
+    late = frame.filter(late_mask)
+    users = (pl.scan_parquet(str(args.data/"val/impressions/part-*.parquet"))
+             .filter(late_mask).select("feed_id", "user_id").sort("feed_id").collect())
+    rows, effects = [], {}
+    references = {"gru_control": .37657187723743313, "gru_with_xl": .3768931070503751}
+    for gru_name, chosen in selections.items():
+        rule = chosen["challenger"]
+        fixed = score(frame, gru_name, "fixed")
+        challenger = score(frame, gru_name, rule)
+        baseline = metrics(fixed, f"{gru_name}-fixed")
+        if abs(baseline["holdout"]["ndcg"] - references[gru_name]) > 1e-8:
+            raise ValueError(f"Unexpected control for {gru_name}")
+        rows.extend([baseline, metrics(challenger, f"{gru_name}-{rule}")])
+        fixed_late, challenger_late = fixed.filter(late_mask), challenger.filter(late_mask)
+        slates = [Slates(scored, "cpu") for scored in (fixed_late, challenger_late)]
+        ids = slates[0].frame["feed_id"].unique(maintain_order=True).to_numpy()
+        if not np.array_equal(ids, users["feed_id"].to_numpy()):
+            raise ValueError("User rows do not match the validation feeds")
+        base, trial = [s.per_feed_ndcg(s.pack("score")).numpy().astype(np.float64) for s in slates]
+        flag = "qsm_changed" if rule == "clip-qsm" else f"{gru_name}_changed"
+        affected = late.filter(pl.col(flag)).select("feed_id").unique().height
+        effects[gru_name] = dict(affected_feeds=affected,
+                                 bootstrap=paired_interval(trial-base, users["user_id"].to_numpy()))
+        if affected:
+            effects[gru_name]["affected_ndcg"] = [ndcg(scored.filter(pl.col(flag)))["ndcg"]
+                                                  for scored in (fixed_late, challenger_late)]
+    report(args, rows, selections=selections, early_trials=trials, split1_end=EARLY_SPLIT,
+           holdout_feeds=users.height, clipping_z_threshold=3, holdout_effects=effects)
+
+
 def adapted_period_blend(args):
     from ensemble import Slates
     from pair_blend import paired_interval
@@ -608,7 +679,8 @@ def queue(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("stage", choices=(*STAGES, *EVENING, "cat-periods", "adapted-period-blend", "epochs-trees", "average-epochs",
-                                         "history-weights", "agreement-weights", "queue", "evening-queue", "cat-queue"))
+                                         "history-weights", "agreement-weights", "clip-blend-scores",
+                                         "queue", "evening-queue", "cat-queue"))
     for key in ("data", "runs", "output"):
         parser.add_argument("--"+key, required=True, type=lambda value: Path(value).resolve())
     parser.add_argument("--gpu", default="0")
@@ -624,5 +696,5 @@ if __name__ == "__main__":
     {"epochs": gru_run, "period": gru_run, "third-period": gru_run, "adapt-v3": gru_run,
      "period-blend": period_blend, "cat-periods": cat_periods, "adapted-period-blend": adapted_period_blend,
      "groups": grouping, "qsm": qsm, "epochs-trees": epochs_trees, "average-epochs": average_epochs,
-     "history-weights": history_weights, "agreement-weights": agreement_weights,
+     "history-weights": history_weights, "agreement-weights": agreement_weights, "clip-blend-scores": clip_blend_scores,
      "queue": queue, "evening-queue": queue, "cat-queue": queue}[args.stage](args)
