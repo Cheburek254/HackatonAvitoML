@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -24,6 +25,15 @@ ROUND = "avito-followups"
 BASELINE = .3768931070503751
 SINKHORN_STEPS = 10
 TEMPERATURE = 1.
+SOFTMAX = "softmax-ce"
+
+
+def softmax_ce(scores, target, padding):
+    """Listwise cross-entropy with equal mass over valid positive candidates."""
+    labels = target.masked_fill(padding, 0)
+    mass = labels.sum(1)
+    log_scores = scores.masked_fill(padding, -1e9).log_softmax(1).masked_fill(padding, 0)
+    return (-(labels*log_scores).sum(1)/mass.clamp_min(1)).sum()/(mass > 0).sum().clamp_min(1)
 
 
 def neural_ndcg(scores, target, padding, temperature=TEMPERATURE):
@@ -127,14 +137,14 @@ def mixed_datasets(args, neural):
 
 
 def fit_new(args, neural):
-    listwise = args.stage == "neural-ndcg"
-    if listwise:
+    loss = {"neural-ndcg": neural_ndcg, SOFTMAX: softmax_ce}.get(args.stage)
+    if loss is not None:
         fit, selection, stats_feeds = adaptation_data(args, neural, args.previous/"train-feeds.parquet")
         datasets, details = [fit], [dict(feeds=SIZE, past_stats_feeds=stats_feeds)]
         selection.write_parquet(args.folder/"train-feeds.parquet")
     else:
         datasets, details = mixed_datasets(args, neural)
-    fit = datasets[0] if listwise else ConcatDataset(datasets)
+    fit = datasets[0] if loss is not None else ConcatDataset(datasets)
     val = validate(neural, args)
     batches = neural.loader(fit, 16, shuffle=True, prefetch=True)
     model = neural.Ranker(VARIANT).cuda()
@@ -143,9 +153,9 @@ def fit_new(args, neural):
     model.load_state_dict(source["state_dict"])
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=ADAPT_EPOCHS*len(batches))
-    if listwise:
+    if loss is not None:
         # This subprocess replaces only the loss used by the original V4 training loop.
-        neural.loss_for = lambda variant, scores, target, padding: neural_ndcg(scores, target, padding)
+        neural.loss_for = lambda variant, scores, target, padding: loss(scores, target, padding)
     torch.cuda.reset_peak_memory_stats()
     times = []
     for epoch in range(1, ADAPT_EPOCHS+1):
@@ -171,7 +181,8 @@ def fit_new(args, neural):
             tmp.replace(path)
     torch.save(dict(state_dict={key: value.cpu() for key, value in model.state_dict().items()},
                     variant=VARIANT, history_window=64, experiment=args.stage), args.folder/"model.pt")
-    observe(args, neural, model, val, details, times)
+    evaluate = observe_softmax if args.stage == SOFTMAX else observe
+    evaluate(args, neural, model, val, details, times)
 
 
 def observe(args, neural, model, validation, details, times):
@@ -223,21 +234,118 @@ def observe(args, neural, model, validation, details, times):
            holdout_feeds=users.height, peak_cuda_mib=torch.cuda.max_memory_allocated()/2**20, **settings)
 
 
+def observe_softmax(args, neural, model, validation, details, times):
+    from torch.utils.data import Subset
+    from dcn_attention import BASELINE as DCN_BASELINE, score_mix
+    from ensemble import Slates
+    from pair_blend import paired_interval
+
+    frame = blend(xl_pair_signals(args), pl.col("gru_with_xl")).rename({"score": "control"})
+    frame = scores_into(frame, args.runs/"dcn-v2-vs-mlp-200k/dcn-v2-val.parquet", "baseline_dcn")
+    late = pl.col("timestamp") >= LATE_SPLIT
+    early = frame.filter(~late)
+    control = score_mix(frame, 0.)
+    if abs(ndcg(control.filter(late))["ndcg"] - DCN_BASELINE) > 1e-8:
+        raise ValueError("Did not reproduce the 0.377325 control")
+    reference = [ndcg(control.filter(mask))["ndcg"] for mask in (EARLY, CONFIRM)]
+    indices = np.flatnonzero(validation.feeds["timestamp"].to_numpy() < LATE_SPLIT).tolist()
+    batches = neural.loader(Subset(validation, indices), 16, prefetch=True)
+
+    def score(data, weight):
+        if not weight:
+            return score_mix(data, 0.)
+        first = (1-weight)*pl.col("fifth") + weight*pl.col("new_gru")
+        gru = .375*(first + pl.col("second")) + .25*zscore("xl_pair")
+        updated = blend(data, gru).drop("control").rename({"score": "control"})
+        return score_mix(updated, 0.)
+
+    def load(epoch):
+        state = torch.load(args.folder/f"epoch-{epoch}.pt", map_location="cpu", weights_only=True)
+        model.load_state_dict(state["state_dict"])
+        return state["state_dict"]
+
+    trials = []
+    for epoch in range(1, ADAPT_EPOCHS+1):
+        load(epoch)
+        predicted = neural.scores(model, batches, "cuda")
+        candidate = attach_scores(early, predicted).with_columns(zscore("score").alias("new_gru")).drop("score")
+        for weight in (0., .25, .5, 1.):
+            values = [float(ndcg(score(candidate.filter(mask), weight))["ndcg"]) for mask in (EARLY, CONFIRM)]
+            trials.append(dict(epoch=epoch, weight=weight, early_ndcg=values,
+                               min_gain=min(x-y for x, y in zip(values, reference, strict=True))))
+    selected = max(trials, key=lambda row: row["min_gain"])
+    challenger = max((row for row in trials if row["weight"]), key=lambda row: row["min_gain"])
+    atomic_text(args.folder/"selection.json", json.dumps(dict(selected=selected, challenger=challenger), indent=2))
+    state = load(challenger["epoch"])
+    path = args.folder/"val_predictions.parquet"
+    predict_batches = neural.loader(validation, 16, prefetch=True)
+    write_scores(neural.scores(model, predict_batches, "cuda"), path)
+    torch.save(dict(state_dict=state, variant=VARIANT, history_window=64, experiment=SOFTMAX,
+                    epoch=challenger["epoch"]), args.folder/"model.pt")
+    candidate = scores_into(frame, path, "new_gru")
+    contender = score(candidate, challenger["weight"])
+    load(ADAPT_EPOCHS)
+    sixth = pl.read_parquet(path) if challenger["epoch"] == ADAPT_EPOCHS else neural.scores(model, predict_batches, "cuda")
+    plain = pl.read_parquet(args.previous/"val_predictions.parquet")
+    rows = [metrics(control, "fixed-control"), metrics(contender, "softmax-ce-in-blend"),
+            metrics(attach_scores(frame, plain), "fresh-pairwise-epoch6"),
+            metrics(attach_scores(frame, sixth), "softmax-ce-epoch6")]
+
+    users = (pl.scan_parquet(str(args.data/"val/impressions/part-*.parquet"))
+             .filter(late).select("feed_id", "user_id").sort("feed_id").collect())
+    slates = [Slates(scored.filter(late), "cpu") for scored in (control, contender)]
+    if not np.array_equal(users["feed_id"].to_numpy(), slates[0].frame["feed_id"].unique(maintain_order=True).to_numpy()):
+        raise ValueError("User rows do not match the validation feeds")
+    values = [s.per_feed_ndcg(s.pack("score")).numpy().astype(np.float64) for s in slates]
+    segments = (pl.scan_parquet(str(args.data/"val/impressions/part-*.parquet")).filter(late)
+                .select("feed_id", (pl.col("target").list.sum() == 1).alias("single")).collect())
+    intervals = paired_interval(values[1]-values[0], users["user_id"].to_numpy())
+    by_positive_count = {}
+    for name, item in (("control", control), ("softmax-ce", contender)):
+        merged = item.filter(late).join(segments, on="feed_id", validate="m:1")
+        by_positive_count[name] = {key: ndcg(merged.filter(pl.col("single")==single))["ndcg"]
+                                   for key, single in (("one", True), ("multiple", False))}
+    report(args, rows, train_feeds=SIZE, epochs=ADAPT_EPOCHS, epoch_seconds=times, periods=details,
+           temperature=1, selected=selected, challenger=challenger, early_trials=trials,
+           split1_end=EARLY_SPLIT, holdout_feeds=users.height, holdout_paired_bootstrap=intervals,
+           holdout_by_positive_count=by_positive_count, peak_cuda_mib=torch.cuda.max_memory_allocated()/2**20)
+
+
 def queue(args):
     from team_reports import publish
 
-    wait_for = args.runs/"dcn-v2-vs-mlp-200k/run.status"
-    note("Waiting for DCN-V2 and MLP to release the GPU")
+    softmax_only = args.stage == "softmax-queue"
+    predecessor = "dcn-v2-attention-200k" if softmax_only else "dcn-v2-vs-mlp-200k"
+    wait_for = args.runs/predecessor/"run.status"
+    note(f"Waiting for {predecessor} to release the GPU")
     while not wait_for.exists():
         keep_awake()
         sleep(15)
-    note(f"DCN/MLP exited with status {wait_for.read_text(encoding='utf-8').strip()}")
+    note(f"{predecessor} exited with status {wait_for.read_text(encoding='utf-8').strip()}")
     watch = args.output/"watch.json"
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    if softmax_only and sys.platform == "win32":
+        command = r"""
+        $watch = $env:AVITO_FINISHED_DASHBOARD
+        Get-CimInstance Win32_Process -Filter "Name = 'python.exe' OR Name = 'pythonw.exe'" |
+            Where-Object { $_.CommandLine -match 'dashboard[.]py' -and $_.CommandLine.Contains('"' + $watch + '"') } |
+            ForEach-Object {
+                $window = Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue
+                if ($window -and $window.MainWindowHandle -ne 0 -and $window.CloseMainWindow()) {
+                    $null = $window.WaitForExit(5000)
+                }
+            }
+        """
+        env = dict(os.environ, AVITO_FINISHED_DASHBOARD=str(args.runs/predecessor/"watch.json"))
+        try:
+            subprocess.run(["powershell.exe", "-NoProfile", "-Command", command], env=env,
+                           creationflags=flags, timeout=20, check=True)
+        except (OSError, subprocess.SubprocessError) as error:
+            note(f"Could not close the completed dashboard: {error}")
     subprocess.Popen([sys.executable, str(ROOT/"dashboard.py"), "--watch", str(watch)], cwd=ROOT,
                      creationflags=flags)
     failures = []
-    for name in STAGES:
+    for name in ((SOFTMAX,) if softmax_only else STAGES):
         folder = args.output/name
         folder.mkdir(exist_ok=True)
         result, status, log = (folder/file for file in ("report.json", "run.status", "train.log"))
@@ -266,10 +374,11 @@ def queue(args):
                 failures.append(name)
                 continue
         instructions = folder/"REPRODUCE.md"
+        control = "0,377325 с обычной DCN-V2" if name == SOFTMAX else "0,376893"
         atomic_text(instructions, f"# {name}\n\nРабочая копия V4 b47fdcb и артефакты предыдущих прогонов, "
-                    "включая XL №002 и №003, используются для контроля 0,376893.\n\n"
+                    f"включая XL №002 и №003, используются для контроля {control}.\n\n"
                     f"```powershell\n.\\.venv\\Scripts\\python.exe gru_remaining.py {name} --data C:/study/AvitoData/competition "
-                    "--runs runs/avito-real --output runs/avito-real/gru-remaining-200k --gpu 0\n```\n\n"
+                    f"--runs runs/avito-real --output runs/avito-real/{args.output.name} --gpu 0\n```\n\n"
                     "```json\n" + result.read_text(encoding="utf-8") + "\n```\n")
         for attempt in range(2):
             try:
@@ -286,7 +395,7 @@ def queue(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("stage", choices=(*STAGES, "queue"))
+    parser.add_argument("stage", choices=(*STAGES, SOFTMAX, "queue", "softmax-queue"))
     for key in ("data", "runs", "output"):
         parser.add_argument("--"+key, required=True, type=lambda value: Path(value).resolve())
     parser.add_argument("--gpu", default="0")
@@ -298,7 +407,7 @@ if __name__ == "__main__":
     args.v4_code = args.runs/"valishinqa-v4-worktree"
     args.folder = args.output/args.stage
     args.output.mkdir(parents=True, exist_ok=True)
-    if args.stage == "queue":
+    if args.stage in ("queue", "softmax-queue"):
         queue(args)
     else:
         args.folder.mkdir(exist_ok=True)
