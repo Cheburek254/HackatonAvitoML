@@ -25,15 +25,22 @@ from ranker import BASE_FEATURES, CANDIDATE_COLUMNS, HISTORY_COLUMNS, feed_batch
 TIE_VARIANTS = ("neural-din-plus-ties", "gru-din-plus-ties")
 VARIANTS = ("transformer", "transformer-listmle", "avito-joint", "neural-din", "bst", "gru-din", "sasrec",
             "set-transformer", "neural-pairwise", "neural-din-plus", "gru-din-plus", "gru-din-v3", "gru-din-v4",
-            "gru-din-v4-listnet", "gru-din-v5", "gru-din-xl", *TIE_VARIANTS)
+            "gru-din-v4-listnet", "gru-din-v4-pal", "gru-din-v5", "gru-din-xl", "gru-din-xl-pal", "gru-din-xl-pure",
+            "dcn-v2", *TIE_VARIANTS)
 HISTORY_VARIANTS = {"avito-joint", "neural-din", "bst", "gru-din", "sasrec", "neural-pairwise",
-                    "neural-din-plus", "gru-din-plus", "gru-din-v3", "gru-din-v4", "gru-din-v4-listnet", "gru-din-v5", "gru-din-xl", *TIE_VARIANTS}
-RICH_VARIANTS = {"neural-din-plus", "gru-din-plus", "gru-din-v3", "gru-din-v4", "gru-din-v4-listnet", "gru-din-v5", "gru-din-xl", *TIE_VARIANTS}
-GRU_VARIANTS = {"gru-din", "gru-din-plus", "gru-din-v3", "gru-din-v4", "gru-din-v4-listnet", "gru-din-v5", "gru-din-xl", "gru-din-plus-ties"}
-V3_VARIANTS = {"gru-din-v3", "gru-din-v4", "gru-din-v4-listnet", "gru-din-v5", "gru-din-xl"}
-V4_VARIANTS = {"gru-din-v4", "gru-din-v4-listnet", "gru-din-v5", "gru-din-xl"}
+                    "neural-din-plus", "gru-din-plus", "gru-din-v3", "gru-din-v4", "gru-din-v4-listnet",
+                    "gru-din-v4-pal", "gru-din-v5", "gru-din-xl", "gru-din-xl-pal", "gru-din-xl-pure", "dcn-v2", *TIE_VARIANTS}
+RICH_VARIANTS = {"neural-din-plus", "gru-din-plus", "gru-din-v3", "gru-din-v4", "gru-din-v4-listnet",
+                 "gru-din-v4-pal", "gru-din-v5", "gru-din-xl", "gru-din-xl-pal", "gru-din-xl-pure", "dcn-v2", *TIE_VARIANTS}
+GRU_VARIANTS = {"gru-din", "gru-din-plus", "gru-din-v3", "gru-din-v4", "gru-din-v4-listnet",
+                "gru-din-v4-pal", "gru-din-v5", "gru-din-xl", "gru-din-xl-pal", "gru-din-xl-pure", "gru-din-plus-ties"}
+V3_VARIANTS = {"gru-din-v3", "gru-din-v4", "gru-din-v4-listnet", "gru-din-v4-pal", "gru-din-v5",
+               "gru-din-xl", "gru-din-xl-pal", "gru-din-xl-pure", "dcn-v2"}
+V4_VARIANTS = {"gru-din-v4", "gru-din-v4-listnet", "gru-din-v4-pal", "gru-din-v5", "gru-din-xl", "gru-din-xl-pal", "dcn-v2"}
 V5_VARIANTS = {"gru-din-v5"}
-XL_VARIANTS = {"gru-din-xl"}
+XL_VARIANTS = {"gru-din-xl", "gru-din-xl-pal", "gru-din-xl-pure"}
+PAL_VARIANTS = {"gru-din-v4-pal", "gru-din-xl-pal"}
+DCN_VARIANTS = {"dcn-v2"}
 
 
 def id_tensor(values):
@@ -276,23 +283,41 @@ class Feeds(Dataset):
         else:
             candidates = torch.cat([floats, items, missing[:, None]], dim=-1)
         target = torch.tensor(feed["target"], dtype=torch.float32) if self.labeled else torch.zeros(len(items))
-        return feed["feed_id"], feed["item_id"], candidates, cat_ids, user, history_features, events, target
+        pos = torch.tensor(feed["pos"], dtype=torch.long).clamp(0, 304) if "pos" in feed else torch.full((len(items),), -1, dtype=torch.long)
+        return feed["feed_id"], feed["item_id"], candidates, cat_ids, user, history_features, events, pos, target
 
 
 def collate(rows):
-    feeds, items, candidates, categories, users, history, events, target = zip(*rows, strict=True)
+    feeds, items, candidates, categories, users, history, events, positions, target = zip(*rows, strict=True)
     mask = torch.arange(max(map(len, items)))[None, :] >= torch.tensor(list(map(len, items)))[:, None]
     history_mask = torch.arange(max(map(len, history)))[None, :] >= torch.tensor(list(map(len, history)))[:, None]
     inputs = (pad_sequence(candidates, batch_first=True), pad_sequence(categories, batch_first=True), torch.stack(users),
-              mask, pad_sequence(history, batch_first=True), pad_sequence(events, batch_first=True), history_mask)
+              mask, pad_sequence(history, batch_first=True), pad_sequence(events, batch_first=True), history_mask,
+              pad_sequence(positions, batch_first=True, padding_value=-1))
     return feeds, items, inputs, pad_sequence(target, batch_first=True)
+
+
+class CrossLayerV2(nn.Module):
+    """Low-rank Deep & Cross Network v2 layer: x_{l+1} = x_0 * (U(V^T x_l) + b) + x_l."""
+
+    def __init__(self, dim, rank=64, dropout=0.1):
+        super().__init__()
+        self.v = nn.Linear(dim, rank, bias=False)
+        self.u = nn.Linear(rank, dim, bias=True)
+        self.norm = nn.LayerNorm(dim)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x0, xl):
+        cross = x0 * self.u(F.gelu(self.v(xl)))
+        return self.norm(xl + self.drop(cross))
 
 
 class Ranker(nn.Module):
     def __init__(self, variant, width=None):
         super().__init__()
         is_xl = variant in XL_VARIANTS
-        width = width or (256 if is_xl else (128 if variant in RICH_VARIANTS else 64))
+        is_dcn = variant in DCN_VARIANTS
+        width = width or (256 if (is_xl or is_dcn) else (128 if variant in RICH_VARIANTS else 64))
         heads = 8 if width >= 256 else 4
         self.variant = variant
         self.use_grad_checkpoint = False
@@ -309,8 +334,29 @@ class Ranker(nn.Module):
         else:
             self.candidate = nn.Linear(142, width)
         self.user = nn.Linear(128, width)
-        self.output = nn.Linear(width, 1)
-        if variant == "set-transformer":
+        self.output = nn.Linear(width * 2 if is_dcn else width, 1)
+        if is_dcn:
+            # Fuse [cand, user, hist_ctx, cand - feed_mean, cand * user] -> width
+            self.dcn_fuse = nn.Sequential(
+                nn.Linear(width * 5, width),
+                nn.LayerNorm(width),
+                nn.GELU(),
+            )
+            self.cross_layers = nn.ModuleList([CrossLayerV2(width, rank=64, dropout=0.1) for _ in range(4)])
+            self.deep_net = nn.Sequential(
+                nn.Linear(width, width * 2),
+                nn.LayerNorm(width * 2),
+                nn.SiLU(),
+                nn.Dropout(0.15),
+                nn.Linear(width * 2, width * 2),
+                nn.LayerNorm(width * 2),
+                nn.SiLU(),
+                nn.Dropout(0.15),
+                nn.Linear(width * 2, width),
+                nn.LayerNorm(width),
+                nn.SiLU(),
+            )
+        elif variant == "set-transformer":
             self.inducing = nn.Parameter(torch.randn(8, width) / width ** .5)
             self.summarize = nn.MultiheadAttention(width, heads, batch_first=True)
             self.recover = nn.MultiheadAttention(width, heads, batch_first=True)
@@ -334,6 +380,9 @@ class Ranker(nn.Module):
             gru_layers = 2 if is_xl else 1
             self.history_encoder = nn.GRU(width, width, num_layers=gru_layers,
                                           dropout=0.1 if gru_layers > 1 else 0.0, batch_first=True)
+        if variant in PAL_VARIANTS:
+            self.pos_bias = nn.Embedding(305, 1)
+            nn.init.zeros_(self.pos_bias.weight)
 
     @staticmethod
     def layer(width, heads=4):
@@ -362,8 +411,20 @@ class Ranker(nn.Module):
         context, _ = self.history_attention(candidates, tokens, tokens, key_padding_mask=mask, need_weights=False)
         return self.history_norm(candidates + context)
 
-    def forward(self, features, category, user, padding, history, events, history_padding):
+    def forward(self, features, category, user, padding, history, events, history_padding, pos=None):
         items = self.candidate(torch.cat([features, self.category(category)], dim=-1))
+        if self.variant in DCN_VARIANTS:
+            hist_tokens, hist_mask, _ = self.history_tokens(history, events, history_padding)
+            ctx, _ = self.history_attention(items, hist_tokens, hist_tokens, key_padding_mask=hist_mask, need_weights=False)
+            u_tok = self.user(user)[:, None, :].expand_as(items)
+            valid = (~padding).float().unsqueeze(-1)
+            feed_mean = (items * valid).sum(dim=1, keepdim=True) / valid.sum(dim=1, keepdim=True).clamp_min(1.0)
+            x0 = self.dcn_fuse(torch.cat([items, u_tok, ctx, items - feed_mean, items * u_tok], dim=-1))
+            xl = x0
+            for layer in self.cross_layers:
+                xl = layer(x0, xl)
+            deep = self.deep_net(x0)
+            return self.output(torch.cat([xl, deep], dim=-1)).squeeze(-1)
         if self.variant == "avito-joint":
             history, history_mask, _ = self.history_tokens(history, events, history_padding)
             prefix = torch.cat([self.user(user)[:, None, :], history], dim=1)
@@ -390,7 +451,10 @@ class Ranker(nn.Module):
                     tokens = self.encoder.norm(tokens)
             else:
                 tokens = self.encoder(tokens, src_key_padding_mask=mask)
-        return self.output(tokens[:, 1:]).squeeze(-1)
+        rel = self.output(tokens[:, 1:]).squeeze(-1)
+        if self.training and self.variant in PAL_VARIANTS and pos is not None and (pos >= 0).any():
+            return rel + self.pos_bias(pos.clamp(0, 304)).squeeze(-1)
+        return rel
 
 
 def loss_for(variant, scores, target, padding):
@@ -448,7 +512,7 @@ def loader(dataset, batch_size, shuffle=False, *, prefetch=False):
 
 def scores(model, batches, device):
     model.eval()
-    use_bf16 = device == "cuda" and getattr(model, "variant", None) in V4_VARIANTS
+    use_bf16 = device == "cuda" and (getattr(model, "variant", None) in V4_VARIANTS or getattr(model, "variant", None) in XL_VARIANTS)
     chunks = []
     with torch.inference_mode():
         for feeds, items, inputs, _ in batches:
@@ -470,7 +534,7 @@ def labels(dataset):
 def train_epoch(model, optimizer, batches, device, variant, epoch, scheduler=None, accum_steps=1, label=None):
     start = perf_counter()
     model.train()
-    use_bf16 = device == "cuda" and variant in V4_VARIANTS
+    use_bf16 = device == "cuda" and (variant in V4_VARIANTS or variant in XL_VARIANTS)
     tag = label or f"epoch={epoch}"
     optimizer.zero_grad(set_to_none=True)
     total_batches = len(batches)

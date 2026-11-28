@@ -43,6 +43,14 @@ GLOBAL_STATS_FEATURES = [
 RECENT_GLOBAL_FEATURES = [
     "global_recent_shows_log", "global_recent_ctr", "global_recent_ctr_delta",
 ]
+GRAPH_FEATURES = [
+    "g_hist_u", "g_hist_h", "g_hist_cnt", "g_hist_coh", "g_hist_u_delta",
+]
+V5_NEW_FEATURES = [
+    "top5_f1_cosine", "top5_f3_cosine", "cand_mean_cos",
+    "din_src1_max_cosine", "din_src0_max_cosine", "din_src1_ev1_max_cosine",
+    "f1_zscore", "f1_minus_max", "f1_cat_delta", "f3_cat_delta",
+]
 V4_EXTRA_FEATURES = [
     "global_item_hist_log", "global_item_hist_delta", "global_user_feeds_log", "global_user_ctr",
     "cat_din_max_cosine", "f5_x_din_decay", "f5z_x_din_decay", "f1_zscore", "f2_zscore", "f4_zscore",
@@ -80,6 +88,8 @@ VARIANTS = {
     "din-events-v3": [*FEATURES, *DIN_FEATURES, *EVENT_DIN_FEATURES, *FEED_CONTEXT_FEATURES, *GLOBAL_STATS_FEATURES],
     "din-events-v3-qsm": [*FEATURES, *DIN_FEATURES, *EVENT_DIN_FEATURES, *FEED_CONTEXT_FEATURES, *GLOBAL_STATS_FEATURES],
     "din-events-v3-robust": [*FEATURES, *DIN_FEATURES, *EVENT_DIN_FEATURES, *FEED_CONTEXT_FEATURES, *GLOBAL_STATS_FEATURES, *RECENT_GLOBAL_FEATURES],
+    "din-events-v4-graph": [*FEATURES, *DIN_FEATURES, *EVENT_DIN_FEATURES, *FEED_CONTEXT_FEATURES, *GLOBAL_STATS_FEATURES, *GRAPH_FEATURES],
+    "din-events-v5-qsm": [*FEATURES, *DIN_FEATURES, *EVENT_DIN_FEATURES, *FEED_CONTEXT_FEATURES, *GLOBAL_STATS_FEATURES, *V5_NEW_FEATURES],
     "din-events-v4-qsm": [*FEATURES, *DIN_FEATURES, *EVENT_DIN_FEATURES, *FEED_CONTEXT_FEATURES, *GLOBAL_STATS_FEATURES, *V4_EXTRA_FEATURES],
 }
 VARIANTS["din-events-v2-ties"] = [
@@ -272,6 +282,42 @@ def vector_features(feed, embeddings, feature_names, reference, clusters=None):
     if top_feature in feature_names:
         f5 = np.nan_to_num(np.asarray(feed["f5"], dtype=np.float32), nan=-1e9)
         result[top_feature] = top_f5_prototype(items, f5, item_indices, include_ties=top_feature == TOP_F5_WITH_TIES)
+    if "top5_f1_cosine" in feature_names:
+        f1 = np.nan_to_num(np.asarray(feed["f1"], dtype=np.float32), nan=-1e9)
+        result["top5_f1_cosine"] = top_f5_prototype(items, f1, item_indices, include_ties=False)
+    if "top5_f3_cosine" in feature_names:
+        f3 = np.nan_to_num(np.asarray(feed["f3"], dtype=np.float32), nan=-1e9)
+        result["top5_f3_cosine"] = top_f5_prototype(items, f3, item_indices, include_ties=False)
+    if "cand_mean_cos" in feature_names:
+        c_norms = np.linalg.norm(items, axis=1, keepdims=True)
+        unit_c = np.divide(items, c_norms, out=np.zeros_like(items), where=c_norms > 0)
+        mean_vec = unit_c.sum(axis=0)
+        n_c = len(item_ids)
+        if n_c > 1:
+            result["cand_mean_cos"] = ((unit_c @ mean_vec) - (c_norms[:, 0] > 0).astype(np.float32)) / (n_c - 1)
+        else:
+            result["cand_mean_cos"] = np.zeros(n_c, dtype=np.float32)
+    if "din_src1_max_cosine" in feature_names:
+        rec_items = history_items[recent_vectors]
+        rec_valid = np.linalg.norm(rec_items, axis=1) > 0
+        rec_items = rec_items[rec_valid]
+        if len(rec_items):
+            ev_t_all = np.asarray([0 if v is None else v for v in feed["history__event_type"][:window]], dtype=np.int32)
+            ev_s_all = np.asarray([0 if v is None else v for v in feed["history__event_source"][:window]], dtype=np.int32)
+            r_et = ev_t_all[history_present][recent_vectors][rec_valid]
+            r_es = ev_s_all[history_present][recent_vectors][rec_valid]
+            sims = pair_cosine(items, rec_items)
+            s1 = r_es == 1
+            s0 = r_es == 0
+            s1e1 = s1 & (r_et == 1)
+            result["din_src1_max_cosine"] = sims[:, s1].max(axis=1) if s1.any() else np.zeros(len(item_ids), dtype=np.float32)
+            result["din_src0_max_cosine"] = sims[:, s0].max(axis=1) if s0.any() else np.zeros(len(item_ids), dtype=np.float32)
+            result["din_src1_ev1_max_cosine"] = sims[:, s1e1].max(axis=1) if s1e1.any() else np.zeros(len(item_ids), dtype=np.float32)
+        else:
+            z = np.zeros(len(item_ids), dtype=np.float32)
+            result["din_src1_max_cosine"] = z
+            result["din_src0_max_cosine"] = z
+            result["din_src1_ev1_max_cosine"] = z
     if "din_long_max_cosine" in feature_names:
         long_mask = ~recent_vectors
         long_items = history_items[long_mask]
@@ -415,7 +461,91 @@ def apply_global_item_stats(candidates, global_stats, is_train, features, cold_d
     return candidates.with_columns(cols).with_columns(delta_cols)
 
 
-def expand_batch(feeds, embeddings, labeled, features, reference, clusters=None, global_stats=None, is_train=False, cold_drop_prob=0.0):
+_GRAPH_PROJ = np.array([0.5, -0.5, 0.5, 0.5], dtype=np.float32)
+
+
+def _project_32d(vectors_128):
+    v = np.asarray(vectors_128, dtype=np.float32).reshape(-1, 32, 4) @ _GRAPH_PROJ
+    norms = np.linalg.norm(v, axis=1, keepdims=True)
+    return np.divide(v, norms, out=np.zeros_like(v), where=norms > 1e-6)
+
+
+def load_global_graph(include_val=False):
+    graph_dir = Path(__file__).resolve().parent / "runs" / "global_graph"
+    with_val = graph_dir / "graph_with_val.npz"
+    path = with_val if (include_val and with_val.is_file()) else (graph_dir / "graph_train.npz")
+    if not path.is_file():
+        raise FileNotFoundError(f"Global graph cache not found at {path}; run build_global_graph.py first")
+    print(f"Using global audience graph: {path.name}", flush=True)
+    z = np.load(path)
+    return (
+        z["hist_ids"], z["hist_vec"], z["hist_cnt"], z["hist_coh"],
+        z["click_ids"], z["click_vec"], z["click_cnt"], z["click_coh"],
+    )
+
+
+def apply_global_graph(feeds, candidates, embeddings, global_graph, is_train):
+    h_ids, h_vec, h_cnt, h_coh, *_ = global_graph
+    u32 = _project_32d(feeds["user_embedding"].list.to_array(128).to_numpy())
+    h32 = np.zeros_like(u32)
+    w_decay = np.exp2(-np.arange(32, dtype=np.float32) / 8.0)
+    for row_i, h_idx_s in enumerate(feeds["history__item_id__embedding_idx"].list.head(32)):
+        arr = h_idx_s.to_numpy().astype(np.intp)
+        valid = arr >= 0
+        if valid.any():
+            h32[row_i] = w_decay[:len(arr)][valid] @ _project_32d(embeddings[arr[valid]])
+    hn = np.linalg.norm(h32, axis=1, keepdims=True)
+    h32 = np.divide(h32, hn, out=np.zeros_like(h32), where=hn > 1e-6)
+
+    lens = feeds["item_id"].list.len().to_numpy()
+    owner = np.repeat(np.arange(feeds.height, dtype=np.int32), lens)
+    cand_ids = candidates["item_id"].to_numpy().astype(np.int32)
+    u_cand = u32[owner]
+    h_cand = h32[owner]
+
+    # Target-free history audience profile only (no click/target features -> zero target leak)
+    hidx = np.minimum(np.searchsorted(h_ids, cand_ids), len(h_ids) - 1)
+    hhit = (cand_ids > 0) & (h_ids[hidx] == cand_ids)
+    hc = np.where(hhit, h_cnt[hidx], 0).astype(np.float32)
+    hcoh = np.where(hhit, h_coh[hidx] / 255.0, 0.0).astype(np.float32)
+    hprof = np.where(hhit[:, None], h_vec[hidx].astype(np.float32) / 127.0, 0.0)
+
+    if is_train:
+        h64_lists = feeds["history__item_id"].list.head(64).to_list()
+        h_sub_mask = np.zeros(len(cand_ids), dtype=bool)
+        pos_off = 0
+        for r_i, L in enumerate(lens):
+            hset = set(h64_lists[r_i])
+            if hset:
+                sl = cand_ids[pos_off : pos_off + L]
+                for j, cid in enumerate(sl):
+                    if cid > 0 and cid in hset:
+                        h_sub_mask[pos_off + j] = True
+            pos_off += L
+        h_sub = h_sub_mask & hhit & (hc > 0)
+        if h_sub.any():
+            hc_new = np.maximum(hc[h_sub] - 1.0, 0.0)
+            zeroed = hc_new <= 0
+            hc[h_sub] = hc_new
+            if zeroed.any():
+                sub_idx = np.flatnonzero(h_sub)[zeroed]
+                hprof[sub_idx] = 0.0
+                hcoh[sub_idx] = 0.0
+
+    g_hist_u = np.einsum("ij,ij->i", u_cand, hprof).astype(np.float32)
+    g_hist_h = np.einsum("ij,ij->i", h_cand, hprof).astype(np.float32)
+
+    return candidates.with_columns(
+        pl.Series("g_hist_u", g_hist_u, dtype=pl.Float32),
+        pl.Series("g_hist_h", g_hist_h, dtype=pl.Float32),
+        pl.Series("g_hist_cnt", np.log1p(hc).astype(np.float32), dtype=pl.Float32),
+        pl.Series("g_hist_coh", hcoh.astype(np.float32), dtype=pl.Float32),
+    ).with_columns(
+        (pl.col("g_hist_u") - pl.col("g_hist_u").mean().over("feed_id")).cast(pl.Float32).alias("g_hist_u_delta"),
+    )
+
+
+def expand_batch(feeds, embeddings, labeled, features, reference, clusters=None, global_stats=None, is_train=False, cold_drop_prob=0.0, global_graph=None):
     per_feed = [vector_features(feed, embeddings, features, reference, clusters) for feed in feeds.iter_rows(named=True)]
     has_pos = "pos" in feeds.columns
     need_user = "global_user_ctr" in features and "user_id" in feeds.columns
@@ -425,6 +555,8 @@ def expand_batch(feeds, embeddings, labeled, features, reference, clusters=None,
     candidates = feeds.select(*select_cols).explode(arrays).drop("item_id__embedding_idx")
     if global_stats is not None:
         candidates = apply_global_item_stats(candidates, global_stats, is_train, features, cold_drop_prob=cold_drop_prob)
+    if global_graph is not None:
+        candidates = apply_global_graph(feeds, candidates, embeddings, global_graph, is_train)
     if has_ts:
         candidates = candidates.drop("timestamp")
     if need_user:
@@ -469,8 +601,15 @@ def expand_batch(feeds, embeddings, labeled, features, reference, clusters=None,
             pl.len().over("feed_id").cast(pl.Float32).alias("feed_size"),
         ])
     if "f1_zscore" in features:
+        extra_ranks.append(((pl.col("f1") - pl.col("f1").mean().over("feed_id")) / pl.col("f1").std().over("feed_id").fill_null(1.0).clip(lower_bound=1e-6)).cast(pl.Float32).alias("f1_zscore"))
+    if "f1_minus_max" in features:
         extra_ranks.extend([
-            ((pl.col("f1") - pl.col("f1").mean().over("feed_id")) / pl.col("f1").std().over("feed_id").fill_null(1.0).clip(lower_bound=1e-6)).cast(pl.Float32).alias("f1_zscore"),
+            (pl.col("f1") - pl.col("f1").max().over("feed_id")).cast(pl.Float32).alias("f1_minus_max"),
+            (pl.col("f1") - pl.col("f1").mean().over("feed_id", "category_id")).cast(pl.Float32).alias("f1_cat_delta"),
+            (pl.col("f3") - pl.col("f3").mean().over("feed_id", "category_id")).cast(pl.Float32).alias("f3_cat_delta"),
+        ])
+    if "f2_zscore" in features:
+        extra_ranks.extend([
             ((pl.col("f2") - pl.col("f2").mean().over("feed_id")) / pl.col("f2").std().over("feed_id").fill_null(1.0).clip(lower_bound=1e-6)).cast(pl.Float32).alias("f2_zscore"),
             ((pl.col("f4") - pl.col("f4").mean().over("feed_id")) / pl.col("f4").std().over("feed_id").fill_null(1.0).clip(lower_bound=1e-6)).cast(pl.Float32).alias("f4_zscore"),
             (pl.col("f5") * pl.col("din_decay_max_cosine")).cast(pl.Float32).alias("f5_x_din_decay"),
@@ -551,6 +690,7 @@ def candidate_batches(split, *, features=FEATURES, labeled=False, max_feeds=0,
     if EVENT_DIN_FEATURES[0] in features:
         columns.extend(["history__event_type", "history__event_source"])
     need_global = GLOBAL_STATS_FEATURES[0] in features
+    need_graph = GRAPH_FEATURES[0] in features
     if "pos_bias" in features or (need_global and split.name == "train"):
         first_part = next(iter(sorted((split / "impressions").glob("part-*.parquet"))), None)
         if first_part is not None and "pos" in pq.ParquetFile(first_part).schema_arrow.names:
@@ -570,7 +710,7 @@ def candidate_batches(split, *, features=FEATURES, labeled=False, max_feeds=0,
             if batch.height:
                 yield batch
 
-    if feature_workers > 1 and not need_global:
+    if feature_workers > 1 and not need_global and not need_graph:
         if reference is not None or centers is not None:
             raise ValueError("Parallel feature workers require features without fitted reference or cluster centers")
         yield from parallel_candidates(split, selected_batches(), labeled, features, feature_workers)
@@ -578,6 +718,7 @@ def candidate_batches(split, *, features=FEATURES, labeled=False, max_feeds=0,
 
     embeddings = open_embeddings(split)
     global_stats = load_global_item_stats(include_val=(split.name == "test")) if need_global else None
+    global_graph = load_global_graph(include_val=(split.name == "test")) if need_graph else None
     is_train = split.name == "train"
     clusters = None
     if centers is not None:
@@ -592,7 +733,7 @@ def candidate_batches(split, *, features=FEATURES, labeled=False, max_feeds=0,
     next_report = 25_000
     for batch in selected_batches():
         yield expand_batch(batch, embeddings, labeled, features, reference, clusters, global_stats, is_train,
-                           cold_drop_prob=cold_drop_prob if is_train else 0.0)
+                           cold_drop_prob=cold_drop_prob if is_train else 0.0, global_graph=global_graph)
         processed_feeds += batch.height
         if processed_feeds >= next_report:
             print(f"  prepared {processed_feeds:,} feeds ({split.name})...", flush=True)
@@ -653,11 +794,11 @@ def train_centers(args):
 def new_model(args, iterations):
     if args.variant == "lambda":
         loss = "LambdaMart:metric=NDCG"
-    elif args.variant in {"din-events-v3-qsm", "din-events-v3-robust", "din-events-v4-qsm"}:
+    elif args.variant in {"din-events-v3-qsm", "din-events-v3-robust", "din-events-v4-graph", "din-events-v5-qsm", "din-events-v4-qsm"}:
         loss = "QuerySoftMax"
     else:
         loss = "YetiRank"
-    depth = 7 if args.variant in {"din-events-v3-qsm", "din-events-v3-robust", "din-events-v4-qsm"} else 6
+    depth = 7 if args.variant in {"din-events-v3-qsm", "din-events-v3-robust", "din-events-v4-graph", "din-events-v5-qsm", "din-events-v4-qsm"} else 6
     return CatBoostRanker(
         loss_function=loss,
         eval_metric="RMSE" if args.device == "gpu" else NDCG,
@@ -691,7 +832,7 @@ def select_gpu_checkpoint(model, tuning, val_pool, args):
 
     metric = gpu_ndcg_evaluator(tuning)
     step = max(1, args.iterations // 20)
-    if args.variant not in {"din-events-v2", "din-events-v2-ties", "din-events-v3-qsm", "din-events-v3-robust", "din-events-v4-qsm"}:
+    if args.variant not in {"din-events-v2", "din-events-v2-ties", "din-events-v3-qsm", "din-events-v3-robust", "din-events-v4-graph", "din-events-v5-qsm", "din-events-v4-qsm"}:
         step = min(5, step)
     checkpoints = sorted({1, model.tree_count_, *range(step, model.tree_count_, step)})
     full_prediction = try_gpu_scores(model, val_pool, args.threads)
@@ -822,7 +963,7 @@ def train(args):
     report["peak_private_mib"] = peak_ram_mib(private=True)
     (args.output / "metrics.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(json.dumps({key: value for key, value in report.items() if key != "tuning_curve"}, indent=2))
-    if args.tune_before is None and train_feeds >= 10_000 and not args.output.name.startswith("_"):
+    if train_feeds >= 10_000 and not args.output.name.startswith("_"):
         try:
             import notify_tg
             notify_tg.send(notify_tg.format_ranker(args.output, report))
@@ -907,7 +1048,17 @@ def main():
 
         selected = select_gpu(args.gpu_id)
         print(f"CatBoost GPU: {selected.name} ({selected.uuid})", flush=True)
-    args.run(args)
+    try:
+        args.run(args)
+    except Exception as exc:
+        if (args.run is train and not args.output.name.startswith("_")
+                and (args.train_feeds == 0 or args.train_feeds >= 10_000)):
+            try:
+                import notify_tg
+                notify_tg.send(f"❌ {args.variant} failed ({args.output.name}): {type(exc).__name__}: {exc}")
+            except Exception:
+                pass
+        raise
 
 
 if __name__ == "__main__":
