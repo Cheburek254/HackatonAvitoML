@@ -144,20 +144,29 @@ def adaptation_data(args, neural, expected_selection=None, before=None, *, windo
     files, selection = select_feeds(args.data, before)
     if expected_selection is not None and not selection.equals(pl.read_parquet(expected_selection)):
         raise ValueError("The selected training feeds differ from the original adaptation")
+    fit, stats_feeds = materialize_adaptation(args, neural, files, selection, window=window,
+                                             v4_features=v4_features)
+    return fit, selection, stats_feeds
+
+
+def materialize_adaptation(args, neural, files, selection, *, window=64, v4_features=True, history_cutoff=None):
     first, last = selection["timestamp"].min(), selection["timestamp"].max()
     fit = neural.Feeds(args.data / "train", 1, True, window, True, rich_features=True, v3_features=True)
     columns = fit.feeds.columns
     rows = (scan_train(files, columns).filter(pl.col("timestamp").is_between(first, last))
             .join(selection.lazy().select("feed_id"), on="feed_id", how="semi").collect())
-    if len(rows) != SIZE or rows["feed_id"].n_unique() != SIZE:
+    if len(rows) != selection.height or rows["feed_id"].n_unique() != selection.height:
         raise ValueError("Wrong number of adaptation feeds")
-    stats, stats_feeds = historic_stats(files, rows, first) if v4_features else (None, 0)
+    cutoff = first if history_cutoff is None else history_cutoff
+    if cutoff > first:
+        raise ValueError("History statistics must precede the first training feed")
+    stats, stats_feeds = historic_stats(files, rows, cutoff) if v4_features else (None, 0)
     fit.feeds = ShuffledRows(rows, [*neural.CANDIDATE_COLUMNS, "target"])
     fit.v4_features = v4_features
     fit.global_stats = stats
     fit.is_train = False  # Earlier statistics already exclude every adaptation label.
     note(f"Prepared {len(fit):,} adaptation feeds, timestamps {first}–{last}; stats from {stats_feeds:,} earlier feeds")
-    return fit, selection, stats_feeds
+    return fit, stats_feeds
 
 
 def adapt(args):
