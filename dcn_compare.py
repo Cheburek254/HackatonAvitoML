@@ -42,7 +42,7 @@ class Ranker(nn.Module):
         self.head = nn.Sequential(nn.Linear(width, 128), nn.GELU(), nn.Dropout(.10),
                                   nn.Linear(128, 64), nn.GELU(), nn.Linear(64, 1))
 
-    def forward(self, features, category, user, padding, history, events, history_padding):
+    def cross_features(self, features, category, user):
         users = user[:, None, :].expand(-1, features.shape[1], -1)
         initial = self.normalize(torch.cat([features, self.category(category), users], dim=-1))
         hidden = initial
@@ -50,10 +50,13 @@ class Ranker(nn.Module):
             reduced = down(hidden)
             update = initial * up(reduced) if self.name == "dcn-v2" else up(torch.nn.functional.gelu(reduced))
             hidden = hidden + update
-        return self.head(hidden).squeeze(-1)
+        return hidden
+
+    def forward(self, features, category, user, padding, history, events, history_padding):
+        return self.head(self.cross_features(features, category, user)).squeeze(-1)
 
 
-def train_epoch(neural, models, optimizers, schedules, batches, epoch):
+def train_epoch(neural, models, optimizers, schedules, batches, epoch, label="dcn-mlp"):
     started = perf_counter()
     for model in models.values():
         model.train()
@@ -73,8 +76,8 @@ def train_epoch(neural, models, optimizers, schedules, batches, epoch):
             schedules[name].step()
             losses.append(loss.detach())
         if step == 1 or step % 100 == 0 or step == len(batches):
-            dcn, mlp = (float(value) for value in losses)
-            print(f"dcn-mlp epoch={epoch} batch={step}/{len(batches)} loss={dcn:.6f}  mlp={mlp:.6f}", flush=True)
+            summary = " ".join(f"{name}={float(value):.6f}" for name, value in zip(models, losses, strict=True))
+            print(f"{label} epoch={epoch} batch={step}/{len(batches)} {summary}", flush=True)
     return perf_counter() - started
 
 
