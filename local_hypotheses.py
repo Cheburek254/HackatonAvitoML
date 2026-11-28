@@ -340,20 +340,56 @@ def average_epochs(args):
            holdout_paired_bootstrap=interval)
 
 
-def history_weights(args):
-    from ensemble import Slates
-    from pair_blend import paired_interval
-
+def epoch5_period_signals(args):
     frame = signals(args)
     epoch_report = json.loads((args.prior/"epochs/report.json").read_text(encoding="utf-8"))
     if epoch_report["best_epoch"] != 5:
         raise ValueError("Expected saved predictions from the fifth GRU epoch")
     frame = scores_into(frame, args.prior/"epochs/val_predictions.parquet", "fifth")
-    frame = scores_into(frame, args.prior/"period/val_predictions.parquet", "second")
-    gru = .5*(pl.col("fifth") + pl.col("second"))
+    return scores_into(frame, args.prior/"period/val_predictions.parquet", "second")
+
+
+def history_weights(args):
+    frame = epoch5_period_signals(args)
     relative_length = pl.col("history_length").clip(0, 64) / 32 - 1
     rules = {"fixed-control": None, "more-gru-for-long-history": .05*relative_length,
              "more-gru-for-short-history": -.05*relative_length}
+    compare_gru_weights(args, frame, rules, max_weight_shift=.05, saturation_history_events=64)
+
+
+def agreement_weights(args):
+    frame = epoch5_period_signals(args)
+    frame = scores_into(frame, args.runs/"local-evening-200k/third-period/val_predictions.parquet", "third")
+    # Ordering by item ID makes membership deterministic when a model has tied scores.
+    top = frame.select(*KEYS, "timestamp", "fifth", "second", "third").sort(KEYS).with_columns(
+        (pl.col(name).rank("ordinal", descending=True).over("feed_id") <= 10).alias(name)
+        for name in ("fifth", "second", "third")
+    )
+    pairs = (("fifth", "second"), ("fifth", "third"), ("second", "third"))
+    agreement = top.group_by("feed_id").agg(
+        (sum((pl.col(left) & pl.col(right)).sum() for left, right in pairs)
+         / (3 * pl.len().clip(upper_bound=10))).alias("agreement"),
+        pl.col("timestamp").first(),
+    )
+    center = agreement.filter(EARLY)["agreement"].mean()
+    scale = max(center, 1 - center)
+    centered = (pl.col("agreement") - center) / scale
+    rules = {"fixed-control": None,
+             "increase-with-agreement-2.5pp": .025*centered,
+             "increase-with-agreement-5pp": .05*centered,
+             "decrease-with-agreement-2.5pp": -.025*centered,
+             "decrease-with-agreement-5pp": -.05*centered}
+    frame = frame.join(agreement.select("feed_id", "agreement"), on="feed_id", validate="m:1")
+    compare_gru_weights(args, frame, rules, top_k=10, max_weight_shift=.05, agreement_center=center,
+                        agreement_scale=scale, agreement_means=[agreement.filter(mask)["agreement"].mean()
+                        for mask in (EARLY, CONFIRM, pl.col("timestamp") >= LATE_SPLIT)])
+
+
+def compare_gru_weights(args, frame, rules, **settings):
+    from ensemble import Slates
+    from pair_blend import paired_interval
+
+    gru = .5*(pl.col("fifth") + pl.col("second"))
     folds = [frame.filter(mask) for mask in (EARLY, CONFIRM)]
     early_scores = {name: [ndcg(blend(fold, gru, gru_delta=delta))["ndcg"] for fold in folds]
                     for name, delta in rules.items()}
@@ -381,7 +417,7 @@ def history_weights(args):
     interval = paired_interval(per_feed[challenger] - per_feed["fixed-control"], users["user_id"].to_numpy())
     report(args, rows, selected=selected, challenger=challenger, early_scores=early_scores,
            min_early_gain=min_gain, split1_end=EARLY_SPLIT, holdout_feeds=users.height,
-           max_weight_shift=.05, saturation_history_events=64, qsm_trees=800, holdout_paired_bootstrap=interval)
+           qsm_trees=800, holdout_paired_bootstrap=interval, **settings)
 
 
 def adapted_period_blend(args):
@@ -572,7 +608,7 @@ def queue(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("stage", choices=(*STAGES, *EVENING, "cat-periods", "adapted-period-blend", "epochs-trees", "average-epochs",
-                                         "history-weights", "queue", "evening-queue", "cat-queue"))
+                                         "history-weights", "agreement-weights", "queue", "evening-queue", "cat-queue"))
     for key in ("data", "runs", "output"):
         parser.add_argument("--"+key, required=True, type=lambda value: Path(value).resolve())
     parser.add_argument("--gpu", default="0")
@@ -588,5 +624,5 @@ if __name__ == "__main__":
     {"epochs": gru_run, "period": gru_run, "third-period": gru_run, "adapt-v3": gru_run,
      "period-blend": period_blend, "cat-periods": cat_periods, "adapted-period-blend": adapted_period_blend,
      "groups": grouping, "qsm": qsm, "epochs-trees": epochs_trees, "average-epochs": average_epochs,
-     "history-weights": history_weights,
+     "history-weights": history_weights, "agreement-weights": agreement_weights,
      "queue": queue, "evening-queue": queue, "cat-queue": queue}[args.stage](args)
