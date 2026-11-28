@@ -305,6 +305,39 @@ def epochs_trees(args):
            early_winner=early_winner, qsm800_max_z_error=score_error, holdout_paired_bootstrap=intervals)
 
 
+def average_epochs(args):
+    from ensemble import Slates
+    from pair_blend import paired_interval
+
+    frame = signals(args)
+    epoch_report = json.loads((args.prior/"epochs/report.json").read_text(encoding="utf-8"))
+    if epoch_report["best_epoch"] != 5:
+        raise ValueError("Expected saved predictions from the fifth GRU epoch")
+    frame = scores_into(frame, args.prior/"epochs/val_predictions.parquet", "fifth")
+    frame = scores_into(frame, args.prior/"period/val_predictions.parquet", "second")
+    late = pl.col("timestamp") >= LATE_SPLIT
+    rows, split_scores, per_feed = [], {}, {}
+    for name, first in (("epoch5-control", pl.col("fifth")), ("epoch6-reference", pl.col("first")),
+                        ("epoch5-epoch6-average", .5*(pl.col("fifth") + pl.col("first")))):
+        scored = blend(frame, .5*(first + pl.col("second")))
+        rows.append(metrics(scored, name))
+        split_scores[name] = [ndcg(scored.filter(mask))["ndcg"] for mask in (EARLY, CONFIRM, late)]
+        slates = Slates(scored.filter(late), "cpu")
+        per_feed[name] = slates.per_feed_ndcg(slates.pack("score")).numpy().astype(np.float64)
+    if abs(split_scores["epoch5-control"][2] - .37657187723743313) > 1e-8:
+        raise ValueError("Did not reproduce the 0.376572 reference")
+    users = (pl.scan_parquet(str(args.data/"val/impressions/part-*.parquet"))
+             .filter(late).select("feed_id", "user_id").sort("feed_id").collect())
+    if not np.array_equal(users["feed_id"].to_numpy(), slates.frame["feed_id"].unique(maintain_order=True).to_numpy()):
+        raise ValueError("User rows do not match the validation feeds")
+    interval = paired_interval(per_feed["epoch5-epoch6-average"] - per_feed["epoch5-control"],
+                               users["user_id"].to_numpy())
+    report(args, rows, split_scores=split_scores, split_order=["early1", "early2", "late"],
+           split1_end=EARLY_SPLIT, holdout_feeds=users.height, qsm_trees=800,
+           gru_v4_weights={"first_epoch5": .25, "first_epoch6": .25, "second_epoch6": .5},
+           holdout_paired_bootstrap=interval)
+
+
 def adapted_period_blend(args):
     from ensemble import Slates
     from pair_blend import paired_interval
@@ -492,7 +525,7 @@ def queue(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("stage", choices=(*STAGES, *EVENING, "cat-periods", "adapted-period-blend", "epochs-trees",
+    parser.add_argument("stage", choices=(*STAGES, *EVENING, "cat-periods", "adapted-period-blend", "epochs-trees", "average-epochs",
                                          "queue", "evening-queue", "cat-queue"))
     for key in ("data", "runs", "output"):
         parser.add_argument("--"+key, required=True, type=lambda value: Path(value).resolve())
@@ -508,5 +541,5 @@ if __name__ == "__main__":
     destination.mkdir(parents=True, exist_ok=True)
     {"epochs": gru_run, "period": gru_run, "third-period": gru_run, "adapt-v3": gru_run,
      "period-blend": period_blend, "cat-periods": cat_periods, "adapted-period-blend": adapted_period_blend,
-     "groups": grouping, "qsm": qsm, "epochs-trees": epochs_trees,
+     "groups": grouping, "qsm": qsm, "epochs-trees": epochs_trees, "average-epochs": average_epochs,
      "queue": queue, "evening-queue": queue, "cat-queue": queue}[args.stage](args)
