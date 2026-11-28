@@ -420,17 +420,21 @@ def compare_gru_weights(args, frame, rules, **settings):
            qsm_trees=800, holdout_paired_bootstrap=interval, **settings)
 
 
-def clip_blend_scores(args):
-    from ensemble import Slates
-    from pair_blend import paired_interval
-
+def xl_pair_signals(args):
     frame = epoch5_period_signals(args)
     for index in (2, 3):
         path = args.runs.parent/f"gru-din-xl-team-exchange/parts/part-{index:03d}/fit/gru-din-xl/val_predictions.parquet"
         frame = scores_into(frame, path, f"xl{index}")
     frame = frame.with_columns((.5*(pl.col("fifth") + pl.col("second"))).alias("gru_control"),
                                (.5*(pl.col("xl2") + pl.col("xl3"))).alias("xl_pair"))
-    frame = frame.with_columns((.75*pl.col("gru_control") + .25*zscore("xl_pair")).alias("gru_with_xl"))
+    return frame.with_columns((.75*pl.col("gru_control") + .25*zscore("xl_pair")).alias("gru_with_xl"))
+
+
+def clip_blend_scores(args):
+    from ensemble import Slates
+    from pair_blend import paired_interval
+
+    frame = xl_pair_signals(args)
     components = ("qsm", "gru_control", "gru_with_xl")
     frame = frame.with_columns(zscore(name).alias(f"{name}_standardized") for name in components)
     frame = frame.with_columns(pl.col(f"{name}_standardized").clip(-3, 3).alias(f"{name}_bounded")
