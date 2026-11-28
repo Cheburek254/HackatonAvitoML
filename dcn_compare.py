@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
-from time import perf_counter
+from time import perf_counter, sleep
 
 import numpy as np
 import polars as pl
@@ -89,11 +89,16 @@ def attach_model(data, predictions):
             .rename({"score": "new_raw"}))
 
 
-def train(args):
-    from ensemble import Slates
-    from pair_blend import paired_interval
+def read_epoch(path):
+    # Older runs wrote NumPy float64 values into the validation trials.
+    from numpy.core.multiarray import scalar
 
-    neural, _ = init_neural(args)
+    safe_types = [(scalar, "numpy.core.multiarray.scalar"), np.dtype, type(np.dtype(np.float64))]
+    with torch.serialization.safe_globals(safe_types):
+        return torch.load(path, map_location="cpu", weights_only=True)
+
+
+def prepare_validation(args, neural):
     frame = blend(xl_pair_signals(args), pl.col("gru_with_xl")).rename({"score": "control"})
     early = frame.filter(pl.col("timestamp") < LATE_SPLIT)
     n_early = [early.filter(mask)["feed_id"].n_unique() for mask in (EARLY, CONFIRM)]
@@ -105,9 +110,15 @@ def train(args):
     reference = [ndcg(score_mix(early.filter(mask), 0))["ndcg"] for mask in (EARLY, CONFIRM)]
     note(f"Verified baseline {BASELINE:.9f} and early split {n_early}")
 
-    fit, selection, stats_feeds = adaptation_data(args, neural, args.previous/"train-feeds.parquet")
     val = neural.Feeds(args.data/"val", 0, True, 64, True, rich_features=True,
                        v3_features=True, v4_features=True)
+    return frame, early, reference, val
+
+
+def train(args):
+    neural, _ = init_neural(args)
+    frame, early, reference, val = prepare_validation(args, neural)
+    fit, selection, stats_feeds = adaptation_data(args, neural, args.previous/"train-feeds.parquet")
     early_idx = np.flatnonzero(val.feeds["timestamp"].to_numpy() < LATE_SPLIT).tolist()
     train_batches = neural.loader(fit, BATCH_SIZE, shuffle=True, prefetch=True)
     early_batches = neural.loader(Subset(val, early_idx), BATCH_SIZE, prefetch=True)
@@ -126,7 +137,7 @@ def train(args):
         path = args.folder/f"epoch-{epoch}.pt"
         fit.feeds.rng = np.random.default_rng(SEED+epoch)
         if path.exists():
-            state = torch.load(path, map_location="cpu", weights_only=True)
+            state = read_epoch(path)
             for name in NAMES:
                 models[name].load_state_dict(state["models"][name])
                 optimizers[name].load_state_dict(state["optimizers"][name])
@@ -143,7 +154,7 @@ def train(args):
             data = attach_model(early, neural.scores(model, early_batches, "cuda"))
             folds = [data.filter(mask) for mask in (EARLY, CONFIRM)]
             for weight in WEIGHTS:
-                values = [ndcg(score_mix(fold, weight))["ndcg"] for fold in folds]
+                values = [float(ndcg(score_mix(fold, weight))["ndcg"]) for fold in folds]
                 gain = min(value-base for value, base in zip(values, reference, strict=True))
                 trials[name].append(dict(epoch=epoch, weight=weight, early_ndcg=values, min_gain=gain))
             best = max(trials[name][-len(WEIGHTS):], key=lambda row: row["min_gain"])
@@ -155,8 +166,32 @@ def train(args):
                         optimizers={name: opt.state_dict() for name, opt in optimizers.items()},
                         schedules={name: sched.state_dict() for name, sched in schedules.items()},
                         rng_cpu=torch.get_rng_state(), rng_cuda=torch.cuda.get_rng_state(),
-                        trials=trials, times=times), temp)
+                        trials=trials, times=times,
+                        training_peak_cuda_mib=torch.cuda.max_memory_allocated()/2**20), temp)
         temp.replace(path)
+
+    complete_evaluation(args, neural, models, val, frame, reference, trials, times, selection, stats_feeds,
+                        torch.cuda.max_memory_allocated()/2**20)
+
+
+def finalize(args):
+    state = read_epoch(args.folder/f"epoch-{EPOCHS}.pt")
+    if any(len(state["trials"][name]) != EPOCHS*len(WEIGHTS) for name in NAMES) or len(state["times"]) != EPOCHS:
+        raise ValueError("Cannot finalize training without all five completed epochs")
+    selection = pl.read_parquet(args.previous/"train-feeds.parquet")
+    original = json.loads((args.previous/"report.json").read_text(encoding="utf-8"))
+    neural, _ = init_neural(args)
+    frame, _, reference, val = prepare_validation(args, neural)
+    models = {name: Ranker(name).cuda() for name in NAMES}
+    torch.cuda.reset_peak_memory_stats()
+    note(f"Recovered {EPOCHS} completed epochs; evaluating selected checkpoints only")
+    complete_evaluation(args, neural, models, val, frame, reference, state["trials"], state["times"], selection,
+                        original["past_stats_feeds"], state.get("training_peak_cuda_mib"))
+
+
+def complete_evaluation(args, neural, models, val, frame, reference, trials, times, selection, stats_feeds, train_peak):
+    from ensemble import Slates
+    from pair_blend import paired_interval
 
     selected = {name: max(trials[name], key=lambda row: row["min_gain"]) for name in NAMES}
     challenger = {name: max((row for row in trials[name] if row["weight"]), key=lambda row: row["min_gain"])
@@ -176,7 +211,7 @@ def train(args):
     rows, intervals, candidates = [metrics(baseline, "fixed-control")], {}, {}
     for name, choice in challenger.items():
         model = models[name]
-        state = torch.load(args.folder/f"epoch-{choice['epoch']}.pt", map_location="cpu", weights_only=True)
+        state = read_epoch(args.folder/f"epoch-{choice['epoch']}.pt")
         model.load_state_dict(state["models"][name])
         path = args.folder/f"{name}-val.parquet"
         write_scores(neural.scores(model, neural.loader(val, BATCH_SIZE, prefetch=True), "cuda"), path)
@@ -192,7 +227,7 @@ def train(args):
     report(args, rows, train_feeds=SIZE, epochs=EPOCHS, batch_size=BATCH_SIZE, early_reference=reference,
            holdout_feeds=users.height, early_trials=trials, selected=selected, challenger=challenger,
            early_split=EARLY_SPLIT, holdout_paired_bootstrap=intervals, epoch_seconds=times,
-           peak_cuda_mib=torch.cuda.max_memory_allocated()/2**20, stats_feeds=stats_feeds,
+           peak_cuda_mib=train_peak, observed_cuda_mib=torch.cuda.max_memory_allocated()/2**20, stats_feeds=stats_feeds,
            train_timestamps=[selection["timestamp"].min(), selection["timestamp"].max()],
            parameters={name: sum(p.numel() for p in model.parameters()) for name, model in models.items()})
 
@@ -200,18 +235,28 @@ def train(args):
 def queue(args):
     from team_reports import sync
 
+    recover = args.stage == "recover-queue"
+    if recover:
+        wait_for = args.runs/"gru-remaining-200k/neural-ndcg/run.status"
+        note("Waiting for the existing GRU queue to release the GPU")
+        while not wait_for.exists():
+            sleep(15)
+
     log, watch, result, status = (args.folder/name for name in ("train.log", "watch.json", "report.json", "run.status"))
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     status.unlink(missing_ok=True)
     atomic_text(watch, json.dumps(dict(report=str(result), log=str(log), status=str(status), data=str(args.data),
                                        models=["dcn-mlp"], iterations=1, epochs=EPOCHS,
-                                       label="DCN-V2 и MLP · одинаковые 200 000 лент")))
-    subprocess.Popen([sys.executable, str(ROOT/"dashboard.py"), "--watch", str(watch)], cwd=ROOT,
-                     creationflags=flags)
+                                       label="DCN-V2 и MLP · проверка чекпоинтов" if recover
+                                       else "DCN-V2 и MLP · одинаковые 200 000 лент")))
+    if not recover:
+        subprocess.Popen([sys.executable, str(ROOT/"dashboard.py"), "--watch", str(watch)], cwd=ROOT,
+                         creationflags=flags)
     with log.open("ab") as stream:
         stream.write(b"Starting dcn-mlp\n")
         stream.flush()
-        with subprocess.Popen([sys.executable, "-u", "-X", "utf8", str(Path(__file__).resolve()), "train",
+        action = "finalize" if recover else "train"
+        with subprocess.Popen([sys.executable, "-u", "-X", "utf8", str(Path(__file__).resolve()), action,
                                "--data", str(args.data), "--runs", str(args.runs), "--output", str(args.folder),
                                "--gpu", args.gpu], cwd=ROOT, stdout=stream, stderr=subprocess.STDOUT,
                               creationflags=flags) as child:
@@ -243,7 +288,7 @@ def queue(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("stage", choices=("train", "queue"))
+    parser.add_argument("stage", choices=("train", "finalize", "queue", "recover-queue"))
     for key in ("data", "runs", "output"):
         parser.add_argument("--"+key, required=True, type=lambda value: Path(value).resolve())
     parser.add_argument("--gpu", default="0")
@@ -255,4 +300,4 @@ if __name__ == "__main__":
     args.v4_code = args.runs/"valishinqa-v4-worktree"
     args.folder = args.output
     args.folder.mkdir(parents=True, exist_ok=True)
-    {"train": train, "queue": queue}[args.stage](args)
+    {"train": train, "finalize": finalize, "queue": queue, "recover-queue": queue}[args.stage](args)
