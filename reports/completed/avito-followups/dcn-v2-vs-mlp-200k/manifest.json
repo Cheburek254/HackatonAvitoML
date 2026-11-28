@@ -1,0 +1,13 @@
+{
+  "code_revision": "758f894ce67832dd0be0ba6cca4b88efd2b0d76b",
+  "checkpoints": {
+    "dcn-v2.pt": {
+      "bytes": 379958,
+      "sha256": "16a3b380eaea411affdc6bdcf46b6db045281d8096b618a3f158547e5761d685"
+    },
+    "mlp.pt": {
+      "bytes": 379958,
+      "sha256": "ad06779aa23e66016af7137e1bd9cdfb721d791e1d36d53d60ac453ff0eac880"
+    }
+  }
+}
